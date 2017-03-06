@@ -91,6 +91,10 @@ def read_golden(filepath):
 
 # creates n grams for a string and outputs it as a list
 def ngrams(input, n):
+    """Creates n-grams for a string, returning a list.
+     :param n: - n-gram length
+     :returns: list
+    """
     input = input.split(' ')
     output = []
     for i in range(len(input) - n + 1):
@@ -237,12 +241,20 @@ def news_score(html, news_list):
     #printlist('news contents:', contents)
     return cosine_sim(contents, news_list)
 
-def get_html(url):
-    """Fetch HTML and convert to lowercase. If error, prepend with '_HTTP_ERROR_'."""
+def read_url(url):
+    """Fetch HTML from web, & convert to lowercase. If error, prepend with '_HTTP_ERROR_'.
+    * Uses requests
+    * Tries multiple user agents.
+    * Logs errors if encountered.
+
+     :param url: - the full URL
+     :returns: - string, the HTML plus possible error prefix.
+
+    """
     # Some pages dislike custom agents. Define alternatives.
     alt_agents = [
-        'MEMEX_PageClass_bot/0.5',
         'Mozilla/5.0',
+        'MEMEX_PageClass',
         'Gecko/1.0',
         'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_10; rv:33.0) Gecko/20100101 Firefox/33.0',
         'Mozilla/5.0 (compatible, MSIE 11, Windows NT 6.3; Trident/7.0; rv:11.0) like Gecko'
@@ -256,20 +268,56 @@ def get_html(url):
         wait = 1
         if r.status_code == requests.codes['too_many']:
             wait = int(r.headers['Retry-After'])
-        print('*** Agent "%s" failed. Retrying...' % agent)
+        print('*** Agent "%s" failed. --> Retrying <--' % agent[:20])
         sleep(wait) # Reduce chance of 429 error (Too many requests)
     print("\tERROR  :", r.status_code)
     print("\tCOOKIES:", [x for x in r.cookies])
     print("\tHISTORY:", r.history)
     print("\tHEADERS:", r.headers)
-    print("\tRESPONSE:", r.text[:100], '...')
+    print("\tRESPONSE:", r.text[:140].replace('\n','\n\t'), '...')
+
     return "_HTTP_ERROR_" + r.text.lower()
 
-def categorize_url(url, goldwords):
+
+def get_html(url, filename, offline=False):
+    """Get HTML from local file or the web. If web, write local file to filename."""
+    if offline:
+        with open(filename) as f:
+            html = f.read()
+    else:
+        html = read_url(url)
+        with open(filename, 'w') as f:
+            f.write(html)
+    return html
+
+
+def get_cosines(text, gold):
+    """Calculate all cosine similarity scores.
+    :param text: - str, the HTML or text to score
+    :param gold: - list, the list of gold words or key words
+    :returns: - dict of 4 scores
+    
+    """
+    fs = forum_score(text, gold['forum'])
+    ns = news_score(text, gold['news'])
+    text = re.sub(u'[^A-Za-z0-9]+', ' ', text)
+    text_list = text.split(' ') + [' '.join(x) for x in ngrams(text, 2)]
+    cs = cosine_sim(text_list, gold['classified'])
+    ss = cosine_sim(text_list, gold['shopping'])
+
+    return {'forum': fs,
+            'news': ns,
+            'classified': cs,
+            'shopping': ss}
+
+def categorize_url(url, goldwords, offline=False):
     """Categorizes urls as blog | wiki | news | forum | classified | shopping | undecided.
     Returns best guess and a dictionary of scores, which may be empty.
     """
+    THRESH = 0.40
     scores = {}
+    name = url[:25].replace('/','|')
+    url = expand_url(url)
 
     # 1. Check for blog goldwords in URL
     if word_in_url(url, goldwords['blog']):
@@ -281,34 +329,13 @@ def categorize_url(url, goldwords):
         return name_type, scores
 
     # OK, we actually have to look at the page.
-    html = get_html(url)
+    html = get_html(url, 'Pages/{}.html'.format(name), offline=True)
     if html.startswith('_HTTP_ERROR_'):
         return 'ERROR', scores
-
-    # Calculate all cosine similarity scores
-    # It used to stop at the first acceptable, but I want to compare.
-    fs = forum_score(html, goldwords['forum'])
-    ns = news_score(html, goldwords['news'])
-    text = re.sub(u'[^A-Za-z0-9]+', ' ', html)
-    text_list = text.split(' ') + [' '.join(x) for x in ngrams(text, 2)]
-    cs = cosine_sim(text_list, goldwords['classified'])
-    ss = cosine_sim(text_list, goldwords['shopping'])
-
-    scores = {'forum': fs,
-              'news': ns,
-              'classified': cs,
-              'shopping': ss}
-    THRESH = 0.4
-
-    # 3. Forum
-    if fs >= THRESH:
-        return 'forum', scores
-    if ns >= THRESH:
-        return 'news', scores
-    if THRESH < cs > ss:
-        return 'classified', scores
-    if THRESH < ss > cs:
-        return 'shopping', scores
+    scores = get_cosines(html, goldwords)
+    best = max(zip(scores.values(), scores.keys()))[1]
+    if scores[best] > THRESH:
+        return best, scores
 
     # 6. If still undecided, call hyperion grey classifier
     # if url_type=='undecided':
@@ -338,6 +365,28 @@ def print_weights(weights, prefix='\t[', suffix=']'):
         ans.append('%s: %4.2f' % (key[:2], weights[key]))
     print('{}{}{}'.format(prefix, ', '.join(ans), suffix))
 
+
+def _accuracy(df, verbose=True):
+    n_right = df['Correct?'].sum()
+    acc = 1. * n_right / len(df)
+    if verbose:
+        print('\n*ACCURACY*: {}/{} = {:4.2f}'.format(n_right, len(df), acc))
+    return acc
+
+
+def score_df(df, answers, scores):
+    """Compare df to answers and scores. Add answers & scores to df.
+    Prints some scores along the way.
+    :returns: pd.DataFrame, df with new columns
+
+    """
+    df['Test'] = answers
+    df['Correct?'] = df['Test'] == df['Category']
+    df = pd.concat([df, pd.DataFrame(scores)], axis=1)
+    acc = _accuracy(df)
+    return df
+
+
 if __name__ == "__main__":
     import pandas as pd
     gold_words = get_goldwords()
@@ -349,9 +398,8 @@ if __name__ == "__main__":
 
     answers, scores = [], []
     for url in df['URL']:
-        eu = expand_url(url)
-        print('\n' + eu)
-        cat, weights = categorize_url(eu, gold_words)
+        print('\n' + expand_url(url))
+        cat, weights = categorize_url(url, gold_words)
         try:
             print_weights(weights)
         except KeyError:
@@ -360,15 +408,6 @@ if __name__ == "__main__":
         answers.append(cat)
         scores.append(weights)
 
-    df['Test'] = answers
-    df['Correct?'] = df['Test'] == df['Category']
-    df = pd.concat([df, pd.DataFrame(scores)], axis=1)
+    df = score_df(df, answers, scores)
+    df.to_csv('scores.csv')  # , float_format='5.3f')
 
-    print()
-    print(df)
-    df.describe()
-
-    n_right = df['Correct?'].sum()
-    score = n_right / len(df)
-    print()
-    print('*ACCURACY*: {}/{} = {:4.2f}'.format(n_right, len(df), score))

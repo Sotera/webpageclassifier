@@ -1,9 +1,9 @@
-shop
 buy
-sell
-price
-shipping
-discount
 certified
+discount
+price
+sell
 services
+shipping
+shop
 shopping
