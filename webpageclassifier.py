@@ -1,13 +1,14 @@
+# -*- coding: utf-8 -*-
 # webpageclassifier.py
 
-import math
-import re
-import requests
 import collections
 import itertools
-
-from bs4 import BeautifulSoup, SoupStrainer
+import math
+import re
 from time import sleep
+
+import requests
+from bs4 import BeautifulSoup, SoupStrainer
 
 """Categorizes urls as blog|wiki|news|forum|classified|shopping|undecided.
 
@@ -291,51 +292,52 @@ def get_html(url, filename, offline=False):
     return html
 
 
-def get_cosines(text, gold):
+def get_cosines(text, gold, vals={}):
     """Calculate all cosine similarity scores.
     :param text: - str, the HTML or text to score
     :param gold: - list, the list of gold words or key words
-    :returns: - dict of 4 scores
+    :param vals: - dict of scores by name, including: forum, news, classified, shopping
+    :returns: - updated dict of scores, overwriting those 4 items
     
     """
-    fs = forum_score(text, gold['forum'])
-    ns = news_score(text, gold['news'])
+    vals['forum'] = forum_score(text, gold['forum'])
+    vals['news'] = news_score(text, gold['news'])
     text = re.sub(u'[^A-Za-z0-9]+', ' ', text)
     text_list = text.split(' ') + [' '.join(x) for x in ngrams(text, 2)]
-    cs = cosine_sim(text_list, gold['classified'])
-    ss = cosine_sim(text_list, gold['shopping'])
+    vals['classified'] = cosine_sim(text_list, gold['classified'])
+    vals['shopping'] = cosine_sim(text_list, gold['shopping'])
 
-    return {'forum': fs,
-            'news': ns,
-            'classified': cs,
-            'shopping': ss}
+    return vals
 
 def categorize_url(url, goldwords, offline=False):
     """Categorizes urls as blog | wiki | news | forum | classified | shopping | undecided.
     Returns best guess and a dictionary of scores, which may be empty.
     """
     THRESH = 0.40
-    scores = {}
+    scores = {'blog': 0, 'classified': 0, 'forum': 0, 'news': 0, 'shopping': 0, 'wiki': 0, 'undecided': 0}
     name = url[:25].replace('/','|')
     url = expand_url(url)
 
     # 1. Check for blog goldwords in URL
     if word_in_url(url, goldwords['blog']):
+        scores['blog'] = .9
         return 'blog', scores
 
     # 2. Check for category name in URL
     name_type = name_in_url(url)
     if name_type != 'undecided':
+        scores[name_type] = .9
         return name_type, scores
 
     # OK, we actually have to look at the page.
     html = get_html(url, 'Pages/{}.html'.format(name), offline=True)
     if html.startswith('_HTTP_ERROR_'):
         return 'ERROR', scores
-    scores = get_cosines(html, goldwords)
+    scores = get_cosines(html, goldwords, scores)
     best = max(zip(scores.values(), scores.keys()))[1]
     if scores[best] > THRESH:
         return best, scores
+    scores['undecided'] = 1 - scores[best]
 
     # 6. If still undecided, call hyperion grey classifier
     # if url_type=='undecided':
