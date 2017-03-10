@@ -5,6 +5,7 @@ import collections
 import itertools
 import math
 import re
+import os.path
 from time import sleep
 
 import requests
@@ -79,7 +80,10 @@ limitations under the License.
 
 __author__ = 'Asitang Mishra jpl memex'
 
-
+categories = 'blog, classified, forum, news, shopping, wiki, undecided'.split(', ')
+PAGES_DIR = os.path.dirname(__file__) + '/Pages/'
+KEYWORD_DIR = os.path.dirname(__file__) + '/Keywords/'
+HTTP_ERROR = '_HTTP_ERROR_\n'
 
 def read_golden(filepath):
     """Reads a golden file and creates canonical (lowercase) versions of each word.
@@ -89,6 +93,16 @@ def read_golden(filepath):
     with open(filepath, 'r', encoding='cp1252', errors='ignore') as f:
         goldenlist = [x.lower().strip() for x in f.readlines()]
     return goldenlist
+
+
+def get_goldwords():
+    gold_words = {}
+    for name in ['blog', 'forum', 'news', 'shopping', 'classified']:
+        gold_words[name] = read_golden(KEYWORD_DIR + name + '.txt')
+    return gold_words
+
+
+gold_words = get_goldwords()
 
 # creates n grams for a string and outputs it as a list
 def ngrams(input, n):
@@ -248,10 +262,13 @@ def read_url(url):
     * Tries multiple user agents.
     * Logs errors if encountered.
 
-     :param url: - the full URL
+     :param url: - the full URL. If blank, immediately returns error.
      :returns: - string, the HTML plus possible error prefix.
 
     """
+    if url is None:
+        return HTTP_ERROR + ": Empty URL.\n"
+
     # Some pages dislike custom agents. Define alternatives.
     alt_agents = [
         'Mozilla/5.0',
@@ -271,24 +288,30 @@ def read_url(url):
             wait = int(r.headers['Retry-After'])
         print('*** Agent "%s" failed. --> Retrying <--' % agent[:20])
         sleep(wait) # Reduce chance of 429 error (Too many requests)
+
+    # ERROR: Print some diagnostics and return error flag.
     print("\tERROR  :", r.status_code)
     print("\tCOOKIES:", [x for x in r.cookies])
     print("\tHISTORY:", r.history)
     print("\tHEADERS:", r.headers)
     print("\tRESPONSE:", r.text[:140].replace('\n','\n\t'), '...')
+    return HTTP_ERROR + r.text.lower()
 
-    return "_HTTP_ERROR_" + r.text.lower()
 
-
-def get_html(url, filename, offline=False):
+def get_html(url, filename, offline=True):
     """Get HTML from local file or the web. If web, write local file to filename."""
     if offline:
-        with open(filename) as f:
-            html = f.read()
-    else:
-        html = read_url(url)
-        with open(filename, 'w') as f:
-            f.write(html)
+        print("\tOFFLINE mode: looking in %s." % PAGES_DIR)
+        try:
+            with open(PAGES_DIR + filename) as f:
+                html = f.read()
+            return html
+        except OSError:
+            print("Failed to find %s offline. Trying live URL." % filename)
+
+    html = read_url(url)
+    with open(filename, 'w') as f:
+        f.write(html)
     return html
 
 
@@ -309,28 +332,30 @@ def get_cosines(text, gold, vals={}):
 
     return vals
 
-def categorize_url(url, goldwords, offline=False):
+
+def categorize_url(url, goldwords, html=None, offline=False):
     """Categorizes urls as blog | wiki | news | forum | classified | shopping | undecided.
     Returns best guess and a dictionary of scores, which may be empty.
     """
     THRESH = 0.40
-    scores = {'blog': 0, 'classified': 0, 'forum': 0, 'news': 0, 'shopping': 0, 'wiki': 0, 'undecided': 0}
-    name = url[:25].replace('/','|')
-    url = expand_url(url)
+    scores = dict(((cat, 0) for cat in categories))
+    if url is not None:
+        # 1. Check for blog goldwords in URL
+        if word_in_url(url, goldwords['blog']):
+            scores['blog'] = .9
+            return 'blog', scores
 
-    # 1. Check for blog goldwords in URL
-    if word_in_url(url, goldwords['blog']):
-        scores['blog'] = .9
-        return 'blog', scores
-
-    # 2. Check for category name in URL
-    name_type = name_in_url(url)
-    if name_type != 'undecided':
-        scores[name_type] = .9
-        return name_type, scores
+        # 2. Check for category name in URL
+        name_type = name_in_url(url)
+        if name_type != 'undecided':
+            scores[name_type] = .9
+            return name_type, scores
 
     # OK, we actually have to look at the page.
-    html = get_html(url, 'Pages/{}.html'.format(name), offline=True)
+    if html is None:
+        name = clean_url(url)
+        url = expand_url(url)
+        html = get_html(url, '{}.html'.format(name), offline=offline)
     if html.startswith('_HTTP_ERROR_'):
         return 'ERROR', scores
     scores = get_cosines(html, goldwords, scores)
@@ -349,17 +374,19 @@ def categorize_url(url, goldwords, offline=False):
     return 'undecided', scores
 
 def expand_url(url):
+    """Add http:// if not already there. Use before browsing."""
     if url.startswith('http'):
         return url
     else:
         return('http://' + url)
 
 
-def get_goldwords():
-    gold_words = {}
-    for name in ['blog', 'forum', 'news', 'shopping', 'classified']:
-        gold_words[name] = read_golden(name + '.txt')
-    return gold_words
+def clean_url(url, length=25):
+    """Remove http[s]://; Replace / with |; Clip at _length_ chars."""
+    if url.startswith('http'):
+        start = url.index('//') + 2
+        url = url[start:]
+    return url[:length].replace('/', '|')
 
 def print_weights(weights, prefix='\t[', suffix=']'):
     ans = []
@@ -390,8 +417,13 @@ def score_df(df, answers, scores):
 
 
 if __name__ == "__main__":
+    import sys
+
+    OFFLINE = True
+    if OFFLINE:
+        print("Running in OFFLINE mode.")
     import pandas as pd
-    gold_words = get_goldwords()
+    import __init__
     for key, val in gold_words.items():
         printlist(key, val)
     with open('urls.csv') as f:
@@ -401,7 +433,7 @@ if __name__ == "__main__":
     answers, scores = [], []
     for url in df['URL']:
         print('\n' + expand_url(url))
-        cat, weights = categorize_url(url, gold_words)
+        cat, weights = categorize_url(url, gold_words, offline=OFFLINE)
         try:
             print_weights(weights)
         except KeyError:
