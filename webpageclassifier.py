@@ -6,10 +6,11 @@ import itertools
 import math
 import re
 import os.path
-from time import sleep
-
 import requests
+
 from bs4 import BeautifulSoup, SoupStrainer
+from time import sleep
+from tqdm import tqdm
 
 """Categorizes urls as blog|wiki|news|forum|classified|shopping|undecided.
 
@@ -84,6 +85,8 @@ categories = 'blog, classified, forum, news, shopping, wiki, undecided'.split(',
 PAGES_DIR = os.path.dirname(__file__) + '/Pages/'
 KEYWORD_DIR = os.path.dirname(__file__) + '/Keywords/'
 HTTP_ERROR = '_HTTP_ERROR_\n'
+THRESH = 0.40
+
 
 def read_golden(filepath):
     """Reads a golden file and creates canonical (lowercase) versions of each word.
@@ -280,7 +283,11 @@ def read_url(url):
         ]
 
     for agent in alt_agents:
-        r = requests.get(url, params={'User-Agent': agent})
+        try:
+            r = requests.get(url, params={'User-Agent': agent})
+        except requests.exceptions.RequestException as e:
+            print("\tConnection Error:", e)
+            break
         if r.status_code == requests.codes['ok']:
             return r.text.lower()
         wait = 1
@@ -290,11 +297,15 @@ def read_url(url):
         sleep(wait) # Reduce chance of 429 error (Too many requests)
 
     # ERROR: Print some diagnostics and return error flag.
-    print("\tERROR  :", r.status_code)
-    print("\tCOOKIES:", [x for x in r.cookies])
-    print("\tHISTORY:", r.history)
-    print("\tHEADERS:", r.headers)
-    print("\tRESPONSE:", r.text[:140].replace('\n','\n\t'), '...')
+    try:
+        print("\tERROR   :", r.status_code)
+        print("\tCOOKIES :", [x for x in r.cookies])
+        print("\tHISTORY :", r.history)
+        print("\tHEADERS :", r.headers)
+        print("\tRESPONSE:", r.text[:200].replace('\n', '\n\t'), '...')
+    except UnboundLocalError:
+        print("\tERROR   : r was undefined - no further information available")
+        return HTTP_ERROR + "Connection Error: no response item"
     return HTTP_ERROR + r.text.lower()
 
 
@@ -310,7 +321,7 @@ def get_html(url, filename, offline=True):
             print("Failed to find %s offline. Trying live URL." % filename)
 
     html = read_url(url)
-    with open(filename, 'w') as f:
+    with open(PAGES_DIR + filename, 'w') as f:
         f.write(html)
     return html
 
@@ -337,7 +348,6 @@ def categorize_url(url, goldwords, html=None, offline=False):
     """Categorizes urls as blog | wiki | news | forum | classified | shopping | undecided.
     Returns best guess and a dictionary of scores, which may be empty.
     """
-    THRESH = 0.40
     scores = dict(((cat, 0) for cat in categories))
     if url is not None:
         # 1. Check for blog goldwords in URL
@@ -395,44 +405,74 @@ def print_weights(weights, prefix='\t[', suffix=']'):
     print('{}{}{}'.format(prefix, ', '.join(ans), suffix))
 
 
-def _accuracy(df, verbose=True):
-    n_right = df['Correct?'].sum()
+def _accuracy(df, colname):
+    """Calculate simple accuracy by summing column 'colname'. Return (n_right, N, acc)."""
+    n_right = df[colname].sum()
     acc = 1. * n_right / len(df)
-    if verbose:
-        print('\n*ACCURACY*: {}/{} = {:4.2f}'.format(n_right, len(df), acc))
-    return acc
+    return n_right, len(df), acc
 
 
-def score_df(df, answers, scores):
+def score_df(df, answers, scores, colname='pagetype', verbose=False):
     """Compare df to answers and scores. Add answers & scores to df.
     Prints some scores along the way.
-    :returns: pd.DataFrame, df with new columns
+    :param df: The dataframe with URLs and answers
+    :param answers: List with predicted categories
+    :param scores: List of dicts with category scores
+    :param colname: String, name of category column
+    :param verbose: Boolean
+    :returns: df2, df_err, report : (df with valid rows & score columns,
+                                    df of error urls,
+                                    string with ERROR & ACC counts)
 
     """
-    df['Test'] = answers
-    df['Correct?'] = df['Test'] == df['Category']
-    df = pd.concat([df, pd.DataFrame(scores)], axis=1)
-    acc = _accuracy(df)
-    return df
+    report = ""
+    df['Best'] = answers
+    scores = pd.DataFrame(scores, index=df.index)
+    df = pd.concat([df, scores], axis=1)
+    df_errs = df['Best'] == 'ERROR'
+    df2 = df[~(df_errs)]
+    # Disable chained-assignments warnings for the next 3 lines
+    # I'm pretty sure I'm not creating a copy of df2 here.
+    pd.set_option('mode.chained_assignment', None)
+    df2['Plural'] = df2['Best'].map(lambda x: x + 's')
+    df2['Correct?'] = (df2['Best'] == df2[colname]) | (df2['Plural'] == df2[colname])
+    pd.set_option('mode.chained_assignment', 'warn')
+
+    if verbose:
+        # print("\ndf:\n----\n", df)
+        # print(df2.filter([colname, 'Best', 'Correct?']))
+        report += "\ndf2\n----\n" + df2.__repr__()
+    n_df = len(df)
+    n_right, n_ok, acc = _accuracy(df2, colname='Correct?')
+    n_err = n_df - n_ok
+    report += "  *ERRORS*: {}/{} = {:4.2f}\n".format(n_err, n_df,
+                                                     n_err / n_df) + "*ACCURACY*: {}/{} = {:4.2f}\n".format(n_right,
+                                                                                                            n_ok, acc)
+    return df2, df[df_errs].filter(['url', 'pagetype', 'Best']), report
 
 
 if __name__ == "__main__":
-    import sys
+    import pandas as pd
 
+    URL_FILE = '../thh-classifiers/dirbot/full_urls.json'
+    # URL_FILE = '50urls.csv'
+    SCORE_FILE = 'scores.csv'
+    ERR_FILE = 'url_errs.json'
     OFFLINE = True
+    MAX_N = 600
+    MAX_URL_LEN = 70
+
+    df = pd.read_json(URL_FILE)
     if OFFLINE:
         print("Running in OFFLINE mode.")
-    import pandas as pd
-    import __init__
     for key, val in gold_words.items():
         printlist(key, val)
-    with open('urls.csv') as f:
-        df = pd.read_csv(f, header=0, skipinitialspace=True)
-    #df = df.iloc[:5]   # Subset for testing
 
+    df = df.sample(n=MAX_N, random_state=42)  # Subset for testing
+    N = len(df.index)
     answers, scores = [], []
-    for url in df['URL']:
-        print('\n' + expand_url(url))
+    for i, url in tqdm(enumerate(df['url'])):
+        # print('\n%d/%d) %s' % (i+1, N, url[7:MAX_URL_LEN]) )
         cat, weights = categorize_url(url, gold_words, offline=OFFLINE)
         try:
             print_weights(weights)
@@ -442,6 +482,9 @@ if __name__ == "__main__":
         answers.append(cat)
         scores.append(weights)
 
-    df = score_df(df, answers, scores)
-    df.to_csv('scores.csv')  # , float_format='5.3f')
-
+    df, df_err, report = score_df(df, answers, scores)
+    df.to_csv(SCORE_FILE)  # , float_format='5.3f')
+    df.to_json(ERR_FILE)
+    print("\nURLs with Errors\n---------------\n", df_err)
+    print("Errors also saved to", ERR_FILE)
+    print(report)
