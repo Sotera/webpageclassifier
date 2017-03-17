@@ -1,0 +1,9 @@
+buy
+certified
+discount
+price
+sell
+services
+shipping
+shop
+shopping

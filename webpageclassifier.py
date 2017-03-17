@@ -1,13 +1,16 @@
+# -*- coding: utf-8 -*-
 # webpageclassifier.py
 
-import math
-import re
-import requests
 import collections
 import itertools
+import math
+import re
+import os.path
+import requests
 
 from bs4 import BeautifulSoup, SoupStrainer
 from time import sleep
+from tqdm import tqdm
 
 """Categorizes urls as blog|wiki|news|forum|classified|shopping|undecided.
 
@@ -78,6 +81,11 @@ limitations under the License.
 
 __author__ = 'Asitang Mishra jpl memex'
 
+categories = 'blog, classified, forum, news, shopping, wiki, undecided'.split(', ')
+PAGES_DIR = os.path.dirname(__file__) + '/Pages/'
+KEYWORD_DIR = os.path.dirname(__file__) + '/Keywords/'
+HTTP_ERROR = '_HTTP_ERROR_\n'
+THRESH = 0.40
 
 
 def read_golden(filepath):
@@ -89,8 +97,22 @@ def read_golden(filepath):
         goldenlist = [x.lower().strip() for x in f.readlines()]
     return goldenlist
 
+
+def get_goldwords():
+    gold_words = {}
+    for name in ['blog', 'forum', 'news', 'shopping', 'classified']:
+        gold_words[name] = read_golden(KEYWORD_DIR + name + '.txt')
+    return gold_words
+
+
+gold_words = get_goldwords()
+
 # creates n grams for a string and outputs it as a list
 def ngrams(input, n):
+    """Creates n-grams for a string, returning a list.
+     :param n: - n-gram length
+     :returns: list
+    """
     input = input.split(' ')
     output = []
     for i in range(len(input) - n + 1):
@@ -237,12 +259,23 @@ def news_score(html, news_list):
     #printlist('news contents:', contents)
     return cosine_sim(contents, news_list)
 
-def get_html(url):
-    """Fetch HTML and convert to lowercase. If error, prepend with '_HTTP_ERROR_'."""
+def read_url(url):
+    """Fetch HTML from web, & convert to lowercase. If error, prepend with '_HTTP_ERROR_'.
+    * Uses requests
+    * Tries multiple user agents.
+    * Logs errors if encountered.
+
+     :param url: - the full URL. If blank, immediately returns error.
+     :returns: - string, the HTML plus possible error prefix.
+
+    """
+    if url is None:
+        return HTTP_ERROR + ": Empty URL.\n"
+
     # Some pages dislike custom agents. Define alternatives.
     alt_agents = [
-        'MEMEX_PageClass_bot/0.5',
         'Mozilla/5.0',
+        'MEMEX_PageClass',
         'Gecko/1.0',
         'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_10; rv:33.0) Gecko/20100101 Firefox/33.0',
         'Mozilla/5.0 (compatible, MSIE 11, Windows NT 6.3; Trident/7.0; rv:11.0) like Gecko'
@@ -250,65 +283,96 @@ def get_html(url):
         ]
 
     for agent in alt_agents:
-        r = requests.get(url, params={'User-Agent': agent})
+        try:
+            r = requests.get(url, params={'User-Agent': agent})
+        except requests.exceptions.RequestException as e:
+            print("\tConnection Error:", e)
+            break
         if r.status_code == requests.codes['ok']:
             return r.text.lower()
         wait = 1
         if r.status_code == requests.codes['too_many']:
             wait = int(r.headers['Retry-After'])
-        print('*** Agent "%s" failed. Retrying...' % agent)
+        print('*** Agent "%s" failed. --> Retrying <--' % agent[:20])
         sleep(wait) # Reduce chance of 429 error (Too many requests)
-    print("\tERROR  :", r.status_code)
-    print("\tCOOKIES:", [x for x in r.cookies])
-    print("\tHISTORY:", r.history)
-    print("\tHEADERS:", r.headers)
-    print("\tRESPONSE:", r.text[:100], '...')
-    return "_HTTP_ERROR_" + r.text.lower()
 
-def categorize_url(url, goldwords):
+    # ERROR: Print some diagnostics and return error flag.
+    try:
+        print("\tERROR   :", r.status_code)
+        print("\tCOOKIES :", [x for x in r.cookies])
+        print("\tHISTORY :", r.history)
+        print("\tHEADERS :", r.headers)
+        print("\tRESPONSE:", r.text[:200].replace('\n', '\n\t'), '...')
+    except UnboundLocalError:
+        print("\tERROR   : r was undefined - no further information available")
+        return HTTP_ERROR + "Connection Error: no response item"
+    return HTTP_ERROR + r.text.lower()
+
+
+def get_html(url, filename, offline=True):
+    """Get HTML from local file or the web. If web, write local file to filename."""
+    if offline:
+        print("\tOFFLINE mode: looking in %s." % PAGES_DIR)
+        try:
+            with open(PAGES_DIR + filename) as f:
+                html = f.read()
+            return html
+        except OSError:
+            print("Failed to find %s offline. Trying live URL." % filename)
+
+    html = read_url(url)
+    with open(PAGES_DIR + filename, 'w') as f:
+        f.write(html)
+    return html
+
+
+def get_cosines(text, gold, vals={}):
+    """Calculate all cosine similarity scores.
+    :param text: - str, the HTML or text to score
+    :param gold: - list, the list of gold words or key words
+    :param vals: - dict of scores by name, including: forum, news, classified, shopping
+    :returns: - updated dict of scores, overwriting those 4 items
+    
+    """
+    vals['forum'] = forum_score(text, gold['forum'])
+    vals['news'] = news_score(text, gold['news'])
+    text = re.sub(u'[^A-Za-z0-9]+', ' ', text)
+    text_list = text.split(' ') + [' '.join(x) for x in ngrams(text, 2)]
+    vals['classified'] = cosine_sim(text_list, gold['classified'])
+    vals['shopping'] = cosine_sim(text_list, gold['shopping'])
+
+    return vals
+
+
+def categorize_url(url, goldwords, html=None, offline=False):
     """Categorizes urls as blog | wiki | news | forum | classified | shopping | undecided.
     Returns best guess and a dictionary of scores, which may be empty.
     """
-    scores = {}
+    scores = dict(((cat, 0) for cat in categories))
+    if url is not None:
+        # 1. Check for blog goldwords in URL
+        if word_in_url(url, goldwords['blog']):
+            scores['blog'] = .9
+            return 'blog', scores
 
-    # 1. Check for blog goldwords in URL
-    if word_in_url(url, goldwords['blog']):
-        return 'blog', scores
-
-    # 2. Check for category name in URL
-    name_type = name_in_url(url)
-    if name_type != 'undecided':
-        return name_type, scores
+        # 2. Check for category name in URL
+        name_type = name_in_url(url)
+        if name_type != 'undecided':
+            scores[name_type] = .9
+            return name_type, scores
 
     # OK, we actually have to look at the page.
-    html = get_html(url)
+    if html is None:
+        name = clean_url(url)
+        url = expand_url(url)
+        html = get_html(url, '{}.html'.format(name), offline=offline)
     if html.startswith('_HTTP_ERROR_'):
         return 'ERROR', scores
-
-    # Calculate all cosine similarity scores
-    # It used to stop at the first acceptable, but I want to compare.
-    fs = forum_score(html, goldwords['forum'])
-    ns = news_score(html, goldwords['news'])
-    text = re.sub(u'[^A-Za-z0-9]+', ' ', html)
-    text_list = text.split(' ') + [' '.join(x) for x in ngrams(text, 2)]
-    cs = cosine_sim(text_list, goldwords['classified'])
-    ss = cosine_sim(text_list, goldwords['shopping'])
-
-    scores = {'forum': fs,
-              'news': ns,
-              'classified': cs,
-              'shopping': ss}
-    THRESH = 0.4
-
-    # 3. Forum
-    if fs >= THRESH:
-        return 'forum', scores
-    if ns >= THRESH:
-        return 'news', scores
-    if THRESH < cs > ss:
-        return 'classified', scores
-    if THRESH < ss > cs:
-        return 'shopping', scores
+    scores = get_cosines(html, goldwords, scores)
+    best = max(zip(scores.values(), scores.keys()))[1]
+    if scores[best] > THRESH:
+        return best, scores
+    scores['undecided'] = 1 - scores[best]
 
     # 6. If still undecided, call hyperion grey classifier
     # if url_type=='undecided':
@@ -320,17 +384,19 @@ def categorize_url(url, goldwords):
     return 'undecided', scores
 
 def expand_url(url):
+    """Add http:// if not already there. Use before browsing."""
     if url.startswith('http'):
         return url
     else:
         return('http://' + url)
 
 
-def get_goldwords():
-    gold_words = {}
-    for name in ['blog', 'forum', 'news', 'shopping', 'classified']:
-        gold_words[name] = read_golden(name + '.txt')
-    return gold_words
+def clean_url(url, length=25):
+    """Remove http[s]://; Replace / with |; Clip at _length_ chars."""
+    if url.startswith('http'):
+        start = url.index('//') + 2
+        url = url[start:]
+    return url[:length].replace('/', '|')
 
 def print_weights(weights, prefix='\t[', suffix=']'):
     ans = []
@@ -338,20 +404,76 @@ def print_weights(weights, prefix='\t[', suffix=']'):
         ans.append('%s: %4.2f' % (key[:2], weights[key]))
     print('{}{}{}'.format(prefix, ', '.join(ans), suffix))
 
+
+def _accuracy(df, colname):
+    """Calculate simple accuracy by summing column 'colname'. Return (n_right, N, acc)."""
+    n_right = df[colname].sum()
+    acc = 1. * n_right / len(df)
+    return n_right, len(df), acc
+
+
+def score_df(df, answers, scores, colname='pagetype', verbose=False):
+    """Compare df to answers and scores. Add answers & scores to df.
+    Prints some scores along the way.
+    :param df: The dataframe with URLs and answers
+    :param answers: List with predicted categories
+    :param scores: List of dicts with category scores
+    :param colname: String, name of category column
+    :param verbose: Boolean
+    :returns: df2, df_err, report : (df with valid rows & score columns,
+                                    df of error urls,
+                                    string with ERROR & ACC counts)
+
+    """
+    report = ""
+    df['Best'] = answers
+    scores = pd.DataFrame(scores, index=df.index)
+    df = pd.concat([df, scores], axis=1)
+    df_errs = df['Best'] == 'ERROR'
+    df2 = df[~(df_errs)]
+    # Disable chained-assignments warnings for the next 3 lines
+    # I'm pretty sure I'm not creating a copy of df2 here.
+    pd.set_option('mode.chained_assignment', None)
+    df2['Plural'] = df2['Best'].map(lambda x: x + 's')
+    df2['Correct?'] = (df2['Best'] == df2[colname]) | (df2['Plural'] == df2[colname])
+    pd.set_option('mode.chained_assignment', 'warn')
+
+    if verbose:
+        # print("\ndf:\n----\n", df)
+        # print(df2.filter([colname, 'Best', 'Correct?']))
+        report += "\ndf2\n----\n" + df2.__repr__()
+    n_df = len(df)
+    n_right, n_ok, acc = _accuracy(df2, colname='Correct?')
+    n_err = n_df - n_ok
+    report += "  *ERRORS*: {}/{} = {:4.2f}\n".format(n_err, n_df,
+                                                     n_err / n_df) + "*ACCURACY*: {}/{} = {:4.2f}\n".format(n_right,
+                                                                                                            n_ok, acc)
+    return df2, df[df_errs].filter(['url', 'pagetype', 'Best']), report
+
+
 if __name__ == "__main__":
     import pandas as pd
-    gold_words = get_goldwords()
+
+    URL_FILE = '../thh-classifiers/dirbot/full_urls.json'
+    # URL_FILE = '50urls.csv'
+    SCORE_FILE = 'scores.csv'
+    ERR_FILE = 'url_errs.json'
+    OFFLINE = True
+    MAX_N = 600
+    MAX_URL_LEN = 70
+
+    df = pd.read_json(URL_FILE)
+    if OFFLINE:
+        print("Running in OFFLINE mode.")
     for key, val in gold_words.items():
         printlist(key, val)
-    with open('urls.csv') as f:
-        df = pd.read_csv(f, header=0, skipinitialspace=True)
-    #df = df.iloc[:5]   # Subset for testing
 
+    df = df.sample(n=MAX_N, random_state=42)  # Subset for testing
+    N = len(df.index)
     answers, scores = [], []
-    for url in df['URL']:
-        eu = expand_url(url)
-        print('\n' + eu)
-        cat, weights = categorize_url(eu, gold_words)
+    for i, url in tqdm(enumerate(df['url'])):
+        # print('\n%d/%d) %s' % (i+1, N, url[7:MAX_URL_LEN]) )
+        cat, weights = categorize_url(url, gold_words, offline=OFFLINE)
         try:
             print_weights(weights)
         except KeyError:
@@ -360,15 +482,9 @@ if __name__ == "__main__":
         answers.append(cat)
         scores.append(weights)
 
-    df['Test'] = answers
-    df['Correct?'] = df['Test'] == df['Category']
-    df = pd.concat([df, pd.DataFrame(scores)], axis=1)
-
-    print()
-    print(df)
-    df.describe()
-
-    n_right = df['Correct?'].sum()
-    score = n_right / len(df)
-    print()
-    print('*ACCURACY*: {}/{} = {:4.2f}'.format(n_right, len(df), score))
+    df, df_err, report = score_df(df, answers, scores)
+    df.to_csv(SCORE_FILE)  # , float_format='5.3f')
+    df.to_json(ERR_FILE)
+    print("\nURLs with Errors\n---------------\n", df_err)
+    print("Errors also saved to", ERR_FILE)
+    print(report)

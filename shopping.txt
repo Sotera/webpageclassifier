@@ -1,9 +1,0 @@
-shop
-buy
-sell
-price
-shipping
-discount
-certified
-services
-shopping

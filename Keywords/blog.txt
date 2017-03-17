@@ -1,8 +1,9 @@
+blog
+.blog.com
 .blogspot.com
-.wordpress.com
 .livejournal.com
 .tumblr.com
-.xanga.com
 .typepad.com
+.wordpress.com
+.xanga.com
 /medium.com/
-.blog.com
