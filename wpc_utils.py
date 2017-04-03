@@ -3,6 +3,8 @@
 import itertools
 import requests
 import logging
+import os.path
+import collections
 from bs4 import BeautifulSoup, SoupStrainer
 from time import sleep
 
@@ -10,6 +12,9 @@ from time import sleep
 Utils for webpageclassifier.
 
 """
+PAGES_DIR = os.path.dirname(__file__) + '/Pages/'
+KEYWORD_DIR = os.path.dirname(__file__) + '/Keywords/'
+HTTP_ERROR = '_HTTP_ERROR_'
 
 def _accuracy(df, colname):
     """Calculate simple accuracy by summing column 'colname'. Return (n_right, N, acc)."""
@@ -18,8 +23,46 @@ def _accuracy(df, colname):
     return n_right, len(df), acc
 
 
+def bleach_url(url):
+    """Remove trailing crud from URL. Use if page doesn't load.
+    
+    >>> bleach_url('government.ru/news/2666/&sa=U&ved=0ahUKEwjbnY')
+    'government.ru/news/2666/'
+    
+    >>> bleach_url('http://www.adsisland.com/?view=selectcity&targetview=post')
+    'http://www.adsisland.com/'
+    
+    >>> bleach_url('http://www.adsisland.com/?view=selectcity')
+    'http://www.adsisland.com/'
+        
+    >>> bleach_url('http://www.adsisland.com/')
+    'http://www.adsisland.com/'
+    
+    >>> bleach_url('www.net-a-porter.com')
+    'www.net-a-porter.com'
+    
+    >>> bleach_url('')
+    ''
+    
+    Alternate approach:
+        try:
+            index = re.search(r'[&?]', url).start()
+            return url[:index]
+        except AttributeError:
+            return url
+
+    """
+    try:
+        index = min((x for x in (url.find('&'), url.find('?')) if x > 0))
+        return url[:index]
+    except ValueError:
+        return url
+
+
 def clean_url(url, length=25):
-    """Remove http[s]://; Replace / with |; Clip at _length_ chars."""
+    """Clean URL to use as filename.
+    Remove http[s]://; Replace / with |; Clip at _length_ chars.
+    """
     if url.startswith('http'):
         start = url.index('//') + 2
         url = url[start:]
@@ -75,18 +118,22 @@ def get_goldwords(names, folder):
 
 
 def get_html(url, filename=None, offline=True):
-    """Get HTML from local file or the web. If web, write local file to filename."""
+    """Get HTML from local file or the web. If web, write local file to filename.
+    
+    If 
+    """
     name, url = clean_url(url), expand_url(url)
+    logging.debug("\tFetching HTML for %s..." % url[7:30])
     if filename is None:
         filename = '{}.html'.format(name)
     if offline:
-        logging.info("\tOFFLINE mode: looking in %s." % PAGES_DIR)
+        logging.debug("\tOFFLINE mode: looking in ...%s." % PAGES_DIR[20:])
         try:
             with open(PAGES_DIR + filename) as f:
                 html = f.read()
             return html
         except OSError:
-            logging.info("Failed to find %s offline. Trying live URL." % filename)
+            logging.info("\tFailed to find %s offline. Trying live URL." % filename)
 
     html = read_url(url)
     with open(PAGES_DIR + filename, 'w') as f:
@@ -149,9 +196,10 @@ def read_url(url):
 
     for agent in alt_agents:
         try:
-            r = requests.get(url, params={'User-Agent': agent})
+            # Consider eventlet Timeout if this is insufficient
+            r = requests.get(url, params={'User-Agent': agent}, timeout=3.05)
         except requests.exceptions.RequestException as e:
-            logging.info("\tConnection Error:", e)
+            logging.info("\tConnection Error: %s" % e)
             break
         if r.status_code == requests.codes['ok']:
             return r.text.lower()
@@ -163,15 +211,15 @@ def read_url(url):
 
     # ERROR: Print some diagnostics and return error flag.
     try:
-        logging.warning("\tERROR   :", r.status_code)
-        logging.warning("\tCOOKIES :", [x for x in r.cookies])
-        logging.warning("\tHISTORY :", r.history)
-        logging.warning("\tHEADERS :", r.headers)
-        logging.warning("\tRESPONSE:", r.text[:200].replace('\n', '\n\t'), '...')
+        logging.warning("\tERROR   : %s" % r.status_code)
+        logging.warning("\tCOOKIES : %s" % [x for x in r.cookies])
+        logging.warning("\tHISTORY : %s" % r.history)
+        logging.warning("\tHEADERS : %s" % r.headers)
+        logging.warning("\tRESPONSE: %s" % r.text[:200].replace('\n', '\n\t'), '...')
     except UnboundLocalError:
         logging.error("\tERROR   : r was undefined - no further information available")
-        return HTTP_ERROR + "Connection Error: no response item"
-    return HTTP_ERROR + r.text.lower()
+        return "%s - Connection Error: no response item" % HTTP_ERROR
+    return ': '.join((HTTP_ERROR, r.text.lower()))
 
 
 def read_golden(filepath):
@@ -183,7 +231,7 @@ def read_golden(filepath):
         with open(filepath, 'r', encoding='cp1252', errors='ignore') as f:
             goldenlist = [x.lower().strip() for x in f.readlines()]
     except FileNotFoundError:
-        logging.warning('Not found: %s. Making blank goldwords list.' % filepath)
+        logging.debug('Not found: %s. Making blank goldwords list.' % filepath)
     return goldenlist
 
 
@@ -222,3 +270,4 @@ def score_df(df, answers, scores, colname='pagetype', verbose=False):
     report.append("*ACCURACY*: {}/{} = {:4.2f}".format(n_right, n_ok, acc))
     report = '\n'.join(report)
     return df2, df[df_errs].filter(['url', 'pagetype', 'Best']), report
+
