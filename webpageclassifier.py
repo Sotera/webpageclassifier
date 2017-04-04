@@ -477,23 +477,29 @@ if __name__ == "__main__":
     predicted = clf.predict(df.url)
     labels = clf.named_steps['jpl'].labels
 
-    # Reporting
-    #............
+    # Show each result
     for url, cat in zip(df.url, predicted):
         print('%25r => %s' % (url[7:30], cat))
 
+    # Remove rows with errors
+    labels, predicted = zip(*[row for row in zip(labels, predicted) if row[1] != ERROR])
+    labels, predicted = np.array(labels), np.array(predicted)
+    classes_ = list(clf.classes_)
+    classes_.remove(ERROR)
+
+    # Metrics
     print(metrics.classification_report(labels, predicted))
     print("Confusion Matrix:")
-    for row in zip(clf.classes_, metrics.confusion_matrix(labels, predicted)):
+    for row in zip(classes_, metrics.confusion_matrix(labels, predicted)):
         print('%20s: %s' % row)
-    print("   µ Info: %4.2f" % metrics.adjusted_mutual_info_score(labels, predicted))
+    print("\n   µ Info: %4.2f" % metrics.adjusted_mutual_info_score(labels, predicted))
     # Homebrew reporting
     model = clf.steps[-1][1]
+    print('  Total #: %4d' % len(df.url))
+    print('  #Errors: %4d \t(%4d Bleached)' % (len(model.errors), len(model.bleached)))
+    print('#Predictd: %4d' % len(predicted))
     print(' Accuracy: %4.2f' % np.mean(predicted == labels))
-    print('  Total #:', len(predicted))
-    print('#Bleached:', len(model.bleached))
-    print('  #Errors:', len(model.errors))
-    print("Errors:")
+    print("\nErrors:")
     for row in model.errors:
         print('\t', row)
     #print(metrics.auc(labels, predicted))
