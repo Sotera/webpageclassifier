@@ -1,16 +1,26 @@
 # -*- coding: utf-8 -*-
 # webpageclassifier.py
 
-import collections
-import itertools
 import math
 import re
-import os.path
-import requests
+import numpy as np
 
-from bs4 import BeautifulSoup, SoupStrainer
-from time import sleep
 from tqdm import tqdm
+from wpc_utils import *
+
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.utils.validation import check_X_y, check_array, check_is_fitted
+from sklearn.utils.multiclass import unique_labels
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.utils.estimator_checks import check_estimator
+from sklearn.feature_extraction import DictVectorizer
+from sklearn.feature_extraction.text import CountVectorizer, TfidfTransformer
+from sklearn.linear_model import SGDClassifier
+from sklearn.pipeline import Pipeline
+from sklearn import metrics
+
+logging.basicConfig(level=logging.INFO)
 
 """Categorizes urls as blog|wiki|news|forum|classified|shopping|undecided.
 
@@ -47,6 +57,10 @@ whereas a 'shopping' page had different kinds of selling words (of course there 
 overlap, the the code takes care of that). Then it checks see if the predicted type is
 independently relevent as a classified of shopping web page (using a threshhold).
 
+ERROR: Uses goldenwords from a labeled set: words that occurred on error pages but not
+ others.  Think '404' and less diagnostic sets. Tried last on the assumption an error
+ page won't resemble other things. 
+
 The flow of how the sites are checked here is very important because of the heirarchy
 on the internet (say a forum can be a shopping forum - the code will correctly classify
 it as a forum)
@@ -79,133 +93,71 @@ limitations under the License.
 
 """
 
-__author__ = 'Asitang Mishra jpl memex'
+__author__ = ['Asitang Mishra jpl memex',
+              'Charles Twardy sotera memex']
 
-categories = 'blog, classified, forum, news, shopping, wiki, undecided'.split(', ')
-PAGES_DIR = os.path.dirname(__file__) + '/Pages/'
-KEYWORD_DIR = os.path.dirname(__file__) + '/Keywords/'
-HTTP_ERROR = '_HTTP_ERROR_\n'
 THRESH = 0.40
+UNDEF = 'UNCERTAIN'
+ERROR = 'error'
+categories = 'blog, classified, forum, news, shopping, wiki'.split(', ')
+categories.extend([UNDEF, ERROR])
+gold_words = get_goldwords(categories, KEYWORD_DIR)
 
 
-def read_golden(filepath):
-    """Reads a golden file and creates canonical (lowercase) versions of each word.
-    Returns a list
-    """
-    goldenlist = []
-    with open(filepath, 'r', encoding='cp1252', errors='ignore') as f:
-        goldenlist = [x.lower().strip() for x in f.readlines()]
-    return goldenlist
-
-
-def get_goldwords():
-    gold_words = {}
-    for name in ['blog', 'forum', 'news', 'shopping', 'classified']:
-        gold_words[name] = read_golden(KEYWORD_DIR + name + '.txt')
-    return gold_words
-
-
-gold_words = get_goldwords()
-
-# creates n grams for a string and outputs it as a list
-def ngrams(input, n):
+def ngrams(word, n):
     """Creates n-grams for a string, returning a list.
+     :param word: str - A word or string to ngram.
      :param n: - n-gram length
-     :returns: list
+     :returns: list of strings
     """
-    input = input.split(' ')
-    output = []
-    for i in range(len(input) - n + 1):
-        output.append(input[i:i + n])
-    return output
+    ans = []
+    word = word.split(' ')
+    for i in range(len(word) - n + 1):
+        ans.append(word[i:i + n])
+    return ans
 
 
-# checks for the existence of a set of words (provided as a list) in the url
-def word_in_url(url, wordlist):
+def url_has(url, wordlist):
+    """True iff wordlist intersect url is not empty."""
     for word in wordlist:
         if word in url:
             return True
     return False
-
-def flatten(l):
-    """From Christian @ http://stackoverflow.com/questions/2158395/flatten-an-irregular-list-of-lists-in-python"""
-    for el in l:
-        if isinstance(el, collections.Iterable) and not isinstance(el, (str, bytes)):
-            yield from flatten(el)
-        else:
-            yield el
-
-def extract_all_classnames(taglist, html_doc):
-    """Extracts all `class` values `html_doc`, but only for tags in `taglist`.
-    Ignores tags w/o class attribute - they don't affect cosine_sim anyway.
-    Returns: flattened generator of class names appearing in tags.
-    Note: returned generator may have "" entries, e.g. for <a class="" href=...>
-    """
-    # Note '_' in next line - soup trick to avoid the Python 'class' keyword.
-    strainer = SoupStrainer(taglist, class_=True)
-    soup = BeautifulSoup(html_doc, 'lxml', parse_only=strainer)
-    return flatten((tag.attrs['class'] for tag in soup.find_all() if 'class' in tag.attrs))
-
-
-def extract_all_fromtag(taglist, html_doc):
-    """Extract all tags in taglist from html_doc. Return as list of Tag.
-    Note some items will be long portions of the document!!
-    """
-    strainer = SoupStrainer(taglist)
-    soup = BeautifulSoup(html_doc, 'lxml', parse_only=strainer)
-    return soup.find_all()
-
-
-# def numberoftags(taglist,html_doc):
-# 	soup = BeautifulSoup(html_doc, 'lxml')
-# 	count=0
-# 	for tag in taglist:
-# 		for classtags in soup.findall(tag):
-# 				count+=1"""
 
 
 def cosine_sim(words, goldwords):
     """Finds the normalized cosine overlap between two texts given as lists.
     """
     # TODO: Speed up the loops? If profile suggests this is taking any time.
-    wordfreq = dict()
-    goldwordfreq = dict()
+    wordfreq = collections.defaultdict(int)
+    goldwordfreq = collections.defaultdict(int)
     commonwords = []
     cosinesum = 0
     sumgoldwords = 0
     sumwords = 0
+    sqrt = math.sqrt
 
     for goldword in goldwords:
-        if goldword in goldwordfreq.keys():
-            goldwordfreq[goldword] = goldwordfreq[goldword] + 1
-        else:
-            goldwordfreq[goldword] = 1
+        goldwordfreq[goldword] += 1
 
     for word in words:
-        if word in wordfreq.keys():
-            wordfreq[word] = wordfreq[word] + 1
-        else:
-            wordfreq[word] = 1
+        wordfreq[word] += 1
 
-    for word in goldwords:
-        if word in wordfreq.keys():
-            if word in goldwordfreq.keys():
-                commonwords.append(word)
-                cosinesum += goldwordfreq[word] * wordfreq[word]
-
+    keys = wordfreq.keys()
     for word in goldwords:
         sumgoldwords += goldwordfreq[word] * goldwordfreq[word]
+        if word in keys:
+            commonwords.append(word)
+            cosinesum += goldwordfreq[word] * wordfreq[word]
 
     for word in commonwords:
         sumwords += wordfreq[word] * wordfreq[word]
 
-    # print(commonwords)
+    logging.debug(commonwords)
 
-    sumwords = math.sqrt(sumwords)
-    sumgoldwords = math.sqrt(sumgoldwords)
-    if sumgoldwords != 0 and sumwords != 0:
-        return cosinesum / (sumwords * sumgoldwords)
-    return 0
+    if sumgoldwords == 0 or sumwords == 0:
+        return 0
+    return cosinesum / (sqrt(sumwords) * sqrt(sumgoldwords))
 
 
 def name_in_url(url):
@@ -221,117 +173,52 @@ def name_in_url(url):
             url_type = word
             count += 1
     if count != 1:
-        url_type = 'undecided'
+        url_type = UNDEF
     return url_type
 
 
-def printlist(name, mylist, N=10, prefix='\t'):
-    """Print first N items of list or generator, prefix & name"""
-    try:
-        print('{}{}: {}...'.format(prefix, name, mylist[:N]))
-    except TypeError:
-        ans = itertools.islice(mylist, N)
-        print('{}{}: {}...'.format(prefix, name, ans))
-
+def get_contents(tags, html, label):
+    """Extract _tags_ from _html_, normalize, and return as string of words"""
+    contents = extract_all_fromtag(tags, html)
+    contents = (re.sub('[^A-Za-z0-9]+', ' ', x.text).strip() for x in contents)
+    logging.debug(prettylist('%s contents:' % label, contents))
+    return ' '.join(contents).split(' ')
 
 def forum_score(html, forum_classnames):
     """Return cosine similarity between the forum_classnames and
     the 'class' attribute of certain tags.
     """
     tags = ['tr', 'td', 'table', 'div', 'p', 'article']
-    classlist = extract_all_classnames(tags, html)
-    #printlist('forum classlist:', classlist)
+    contents = get_contents(tags, html, 'forum')
     # Keep only matches, and only in canonical form. So 'forum' not 'forums'.
     # TODO: doesn't this artificially inflate cosine_sim? By dropping non-matches?
-    classlist = [j for i in classlist for j in forum_classnames if j in i]
-    #printlist('canonical form :', classlist)
+    contents = [j for i in contents for j in forum_classnames if j in i]
+    logging.debug(prettylist('canonical form :', contents))
+    return cosine_sim(contents, forum_classnames)
 
-    return cosine_sim(classlist, forum_classnames)
 
 def news_score(html, news_list):
     """Check if a news website: check the nav, header and footer data
     (all content, class and tags within), use similarity
     """
     tags = ['nav', 'header', 'footer']
-    contents = extract_all_fromtag(tags, html)
-    contents = (re.sub('[^A-Za-z0-9]+', ' ', x.text).strip() for x in contents)
-    contents = ' '.join(contents).split(' ')
-    #printlist('news contents:', contents)
+    contents = get_contents(tags, html, 'news')
     return cosine_sim(contents, news_list)
 
-def read_url(url):
-    """Fetch HTML from web, & convert to lowercase. If error, prepend with '_HTTP_ERROR_'.
-    * Uses requests
-    * Tries multiple user agents.
-    * Logs errors if encountered.
 
-     :param url: - the full URL. If blank, immediately returns error.
-     :returns: - string, the HTML plus possible error prefix.
-
+def error_score(html, error_list):
+    """Check text against 'error' goldenwords; use similarity
     """
-    if url is None:
-        return HTTP_ERROR + ": Empty URL.\n"
-
-    # Some pages dislike custom agents. Define alternatives.
-    alt_agents = [
-        'Mozilla/5.0',
-        'MEMEX_PageClass',
-        'Gecko/1.0',
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_10; rv:33.0) Gecko/20100101 Firefox/33.0',
-        'Mozilla/5.0 (compatible, MSIE 11, Windows NT 6.3; Trident/7.0; rv:11.0) like Gecko'
-        'Mozilla/5.0 (Windows NT 6.1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/41.0.2228.0 Safari/537.36',
-        ]
-
-    for agent in alt_agents:
-        try:
-            r = requests.get(url, params={'User-Agent': agent})
-        except requests.exceptions.RequestException as e:
-            print("\tConnection Error:", e)
-            break
-        if r.status_code == requests.codes['ok']:
-            return r.text.lower()
-        wait = 1
-        if r.status_code == requests.codes['too_many']:
-            wait = int(r.headers['Retry-After'])
-        print('*** Agent "%s" failed. --> Retrying <--' % agent[:20])
-        sleep(wait) # Reduce chance of 429 error (Too many requests)
-
-    # ERROR: Print some diagnostics and return error flag.
-    try:
-        print("\tERROR   :", r.status_code)
-        print("\tCOOKIES :", [x for x in r.cookies])
-        print("\tHISTORY :", r.history)
-        print("\tHEADERS :", r.headers)
-        print("\tRESPONSE:", r.text[:200].replace('\n', '\n\t'), '...')
-    except UnboundLocalError:
-        print("\tERROR   : r was undefined - no further information available")
-        return HTTP_ERROR + "Connection Error: no response item"
-    return HTTP_ERROR + r.text.lower()
-
-
-def get_html(url, filename, offline=True):
-    """Get HTML from local file or the web. If web, write local file to filename."""
-    if offline:
-        print("\tOFFLINE mode: looking in %s." % PAGES_DIR)
-        try:
-            with open(PAGES_DIR + filename) as f:
-                html = f.read()
-            return html
-        except OSError:
-            print("Failed to find %s offline. Trying live URL." % filename)
-
-    html = read_url(url)
-    with open(PAGES_DIR + filename, 'w') as f:
-        f.write(html)
-    return html
-
+    tags = ['tr', 'td', 'table', 'div', 'p', 'article', 'body']
+    contents = get_contents(tags, html, 'error')
+    return cosine_sim(contents, error_list)
 
 def get_cosines(text, gold, vals={}):
     """Calculate all cosine similarity scores.
     :param text: - str, the HTML or text to score
     :param gold: - list, the list of gold words or key words
     :param vals: - dict of scores by name, including: forum, news, classified, shopping
-    :returns: - updated dict of scores, overwriting those 4 items
+    :returns: _vals_, overwriting those 4 fields, if supplied.
     
     """
     vals['forum'] = forum_score(text, gold['forum'])
@@ -340,151 +227,308 @@ def get_cosines(text, gold, vals={}):
     text_list = text.split(' ') + [' '.join(x) for x in ngrams(text, 2)]
     vals['classified'] = cosine_sim(text_list, gold['classified'])
     vals['shopping'] = cosine_sim(text_list, gold['shopping'])
-
+    vals[ERROR] = cosine_sim(text_list, gold['error'])
     return vals
 
 
-def categorize_url(url, goldwords, html=None, offline=False):
-    """Categorizes urls as blog | wiki | news | forum | classified | shopping | undecided.
+def make_jpl_clf(df,
+                 categories: list,
+                 goldwords: dict,
+                 offline=False,
+                 pagetypes=None):
+    """Create the JPL classifier with appropriate labels.
+    :param df: 
+    :param categories: 
+    :param goldwords: 
+    :param offline: 
+    :param pagetypes: list of training labels; default is df.pagetype or df.category
+    :return: the classifier, with cleaned labels in classifier.labels
+    
+    """
+    logging.info("Creating JPL classifier")
+    clf_pipe = Pipeline([#('stem', Lemmatizer()),
+                         #('le', LabelEncoder()),
+                         ('jpl', JPLPageClass(categories=categories,
+                                              goldwords=goldwords,
+                                              offline=offline))])
+    if pagetypes is None:
+        try:
+            pagetypes = list(df.pagetype)
+        except AttributeError:
+            pagetypes = list(df.category)
+    pagetypes = Lemmatizer(wnl=False).fit(pagetypes).transform(pagetypes)
+    clf_pipe.fit(df.url, pagetypes)
+    logging.info("Classifier 'training' completed.")
+    return clf_pipe
+
+
+class Lemmatizer(BaseEstimator, TransformerMixin):
+    """Cleans up labels. Uses WordNet if avail, else simplistic strip final 's'.
+    
+    Based this on LabelTransf
+    #TODO: Figure out how to get this into a classifier pipeline. 
+    Right now it throws:
+    `TypeError: fit_transform() takes 2 positional arguments but 3 were given`
+    
+    >>> labels = ['forum', 'forums', 'news', 'blog', 'blogs', 'news', 'error']
+    >>> lem = Lemmatizer().fit(labels)
+    >>> lem.classes_
+    ['UNDEFINED', 'blog', 'error', 'forum', 'news']
+    
+    >>> lem.transform(labels)
+    ['forum', 'forum', 'news', 'blog', 'blog', 'news', 'error']
+        
+    The wordnet lemmatizer fails here:
+    >>> lem.transform(['wiki', 'wikis', 'shopping'])
+    ['wiki', 'wikis', 'shopping']
+
+    We want 'wikis' -> 'wiki'. So:
+    >>> lem2 = Lemmatizer(wnl=False).fit(labels)
+    >>> lem2.transform(['wiki', 'wikis', 'shopping'])
+    ['wiki', 'wiki', 'shopping']
+         
+    """
+    def __init__(self, goodlist=['news'], categories=[], wnl=True):
+        """Create the lemmatizer.
+        
+        :param goodlist: list - words that bypass lemmatizer. In case WordNet unavail.
+        :param categories: list - default category labels -- ensure they appear
+        :param wnl: bool - Whether to use WordNet if available. 
+        
+        If WordNet is installed, uses a high-quality lemmatizer that probably doesn't
+        need the `goodlist`.  Otherwise send `goodlist` to prevent the simple stripper 
+        from turning "news" into "new", for example. 
+        
+        Note: `categories` will still be lemmatized unless in `goodlist`.   
+        
+        """
+        if not wnl:
+            self.wnl = False
+        else:
+            try:
+                from nltk.stem import WordNetLemmatizer
+                wnl = WordNetLemmatizer()
+            except ImportError:
+                wnl = False
+
+        self.goodlist = frozenset(goodlist)
+        self.categories = categories
+
+    def fit(self, y):
+        """'Fit' lemmatizer. Creates lemmatized classes_ list."""
+        self.classes_ = sorted(set(self._transform(y + self.categories)))
+        return self
+
+    @classmethod
+    def _stem(self, word):
+        ans = word.strip()
+        if ans[-1] != 's' or ans[-2] == 's':
+            return ans
+        return ans[:-1]
+
+    def _transform(self, y):
+        """Lemmatize the labels."""
+        goodlist = self.goodlist
+        stem = self._stem
+        if self.wnl:
+            stem = self.wnl.lemmatize
+
+        ans = list(y)
+        for i, word in enumerate(y):
+            if word in goodlist:
+                continue
+            ans[i] = stem(word)
+        return ans
+
+    def transform(self, y):
+        """Lemmatize the labels and check if new labels have appeared."""
+        labels = self._transform(y)
+        classes = np.unique(labels)
+        if len(np.intersect1d(classes, self.classes_)) < len(classes):
+            diff = np.setdiff1d(classes, self.classes_)
+            logging.warning("Added new labels from y: %s" % str(diff))
+            self.classes_ = np.append(self.classes_, classes)
+
+        return labels
+
+
+class JPLPageClass(BaseEstimator):
+    """Classify pagetype based on the URL and HTML. Tries fastest first.
+    
+    Feed it URLs. If it can decide on those, it does, else it uses 
+    `get_html()` to fetch HTML and try other methods. 
+    
+    Categorizes urls as blog | wiki | news | forum | classified | shopping | _UNDEF_.
     Returns best guess and a dictionary of scores, which may be empty.
+    
     """
-    scores = dict(((cat, 0) for cat in categories))
-    if url is not None:
+
+    def __init__(self,
+                 goldwords: dict,
+                 offline=False,
+                 thresh=0.40,
+                 categories: list=[UNDEF, ERROR]):
+        """Set up the JPL Page Classifier.
+        
+        :param goldwords: dict {label -> "golden words" related to that category
+        :param offline: bool - True if HTML can be found in standard file loc'n
+        :param thresh: float - If no category > thresh, return UNDEF.
+        :param categories: these are the labels we expect we might see
+
+        
+        Note: stored categories will be _singular_ --> no trailing 's'
+                
+        """
+        self.goldwords = goldwords
+        self.offline = offline
+        self.thresh = thresh
+        self.categories = categories
+        self.bleached = []
+        self.errors = []
+        self._estimator_type = "classifier"
+
+    def fit(self, X, y):
+        """Not really fitting, but...
+        
+        :param X: list[str] - a list of URLs
+        :param y: list[str] - a list of page types or classes
+        
+        """
+
+        self.classes_= np.unique(list(y) + self.categories)
+        self.labels = y
+        logging.info('\tclasses_: %s' % self.classes_)
+        #X, y = check_X_y(X, y)
+        return self
+
+    def _score_url(self,
+                   url: 'The URL ',
+                   bleach: bool):
+        """Score the URL using JPL cascade. Only parse HTML if URL inconclusive.
+
+        :param url: The url to score 
+        :param bleach: bool - Try cleaner url if original fails.
+        :return: score vector (numpy array)
+        """
+        # TODO: Move definitions back to predict_proba, and pass in.
+        # As-is, it has to do "self." lookups for each URL.
+        logging.debug('URL: %s' % url[:MAX_URL_LEN])
+        𝜃 = self.thresh
+        scores = np.ones(len(self.classes_)) * .1
+        idx = dict([(key,i) for i, key in enumerate(self.classes_)])
+        def tally(key, val):
+            scores[idx[key]] = val
+
         # 1. Check for blog goldwords in URL
-        if word_in_url(url, goldwords['blog']):
-            scores['blog'] = .9
-            return 'blog', scores
+        if url_has(url, self.goldwords['blog']):
+            tally('blog', .9)
+        else:
+            # 2. Check for category name in URL
+            name_type = name_in_url(url)
+            if name_type != UNDEF:
+                tally(name_type, .9)
+        if max(scores) > 𝜃:
+            return scores / sum(scores)
 
-        # 2. Check for category name in URL
-        name_type = name_in_url(url)
-        if name_type != 'undecided':
-            scores[name_type] = .9
-            return name_type, scores
+        # TODO: URL ngrams
 
-    # OK, we actually have to look at the page.
-    if html is None:
-        name = clean_url(url)
-        url = expand_url(url)
-        html = get_html(url, '{}.html'.format(name), offline=offline)
-    if html.startswith('_HTTP_ERROR_'):
-        return 'ERROR', scores
-    scores = get_cosines(html, goldwords, scores)
-    best = max(zip(scores.values(), scores.keys()))[1]
-    if scores[best] > THRESH:
-        return best, scores
-    scores['undecided'] = 1 - scores[best]
+        # 3. Look at the HTML.
+        html = get_html(url, offline=self.offline)
+        if html.startswith(HTTP_ERROR):
+            if bleach and bleach_url(url) != url:
+                logging.info("Bleaching URL...")
+                self.bleached.append(url)
+                return self._score_url(bleach_url(url), bleach=False) # Avoid inf loop!
+            else:
+                logging.warning('%s: %s ' % (HTTP_ERROR, clean_url(url)))
+                self.errors.append(url)
+                tally(ERROR, .9)
+        else:
+            vals = get_cosines(html, self.goldwords)
+            for key, val in vals.items():
+                tally(key, val)
+        if max(scores) > 𝜃:
+            return scores / sum(scores)
 
-    # 6. If still undecided, call hyperion grey classifier
-    # if url_type=='undecided':
-    #     fs = DumbCategorize(url)
-    #     category=fs.categorize()
-    #     url_type=category
-    #     return url_type
+        # Fallback
+        tally(UNDEF, 1 - max(scores))
+        return scores / sum(scores)
 
-    return 'undecided', scores
+    def predict(self, X):
+        """Return the most likely class, for each x in X."""
+        P = self.predict_proba(X)
+        return self.classes_[np.argmax(P, axis=1)]
 
-def expand_url(url):
-    """Add http:// if not already there. Use before browsing."""
-    if url.startswith('http'):
-        return url
-    else:
-        return('http://' + url)
-
-
-def clean_url(url, length=25):
-    """Remove http[s]://; Replace / with |; Clip at _length_ chars."""
-    if url.startswith('http'):
-        start = url.index('//') + 2
-        url = url[start:]
-    return url[:length].replace('/', '|')
-
-def print_weights(weights, prefix='\t[', suffix=']'):
-    ans = []
-    for key in ['forum', 'news', 'classified', 'shopping']:
-        ans.append('%s: %4.2f' % (key[:2], weights[key]))
-    print('{}{}{}'.format(prefix, ', '.join(ans), suffix))
+    def predict_proba(self, X):
+        """For each x in X, provide vector of probs for each class.
+        
+        Assume X is a list of URLs, and that `get_html(url)` will
+        retrieve HTML as required.
+        
+        """
+        #check_is_fitted(self, ['X_', 'y_'])
+        #X = check_array(X)
+        surl = self._score_url
+        return [surl(url, bleach=True) for url in X]
 
 
-def _accuracy(df, colname):
-    """Calculate simple accuracy by summing column 'colname'. Return (n_right, N, acc)."""
-    n_right = df[colname].sum()
-    acc = 1. * n_right / len(df)
-    return n_right, len(df), acc
+def evaluate(df, clf, predicted):
+    """Evaluate the classifier based on its predictions."""
+    labels = clf.named_steps['jpl'].labels
+    classes_ = list(clf.classes_)
 
+    print(metrics.classification_report(labels, predicted))
+    print("Confusion Matrix:")
+    for row in zip(classes_, metrics.confusion_matrix(labels, predicted)):
+        print('%20s: %s' % (row[0],
+                            ','.join(['%4d' % x for x in row[1]])))
+    print("\n   µ Info: %4.2f" % metrics.adjusted_mutual_info_score(labels, predicted))
 
-def score_df(df, answers, scores, colname='pagetype', verbose=False):
-    """Compare df to answers and scores. Add answers & scores to df.
-    Prints some scores along the way.
-    :param df: The dataframe with URLs and answers
-    :param answers: List with predicted categories
-    :param scores: List of dicts with category scores
-    :param colname: String, name of category column
-    :param verbose: Boolean
-    :returns: df2, df_err, report : (df with valid rows & score columns,
-                                    df of error urls,
-                                    string with ERROR & ACC counts)
+    # Homebrew reporting
+    model = clf.steps[-1][1]
+    print('   Total #: %4d' % len(df.url))
+    print('   #Errors: %4d \t(%4d Bleached)' % (len(model.errors), len(model.bleached)))
+    print('#Predicted: %4d' % len(predicted))
+    print('  Accuracy: %4.2f' % np.mean(predicted == labels))
+    print("\nErrors:")
+    for row in model.errors:
+        print('\t', row)
+    # print(metrics.auc(labels, predicted))
+    # print("ROC Curve:")
+    # print(metrics.roc_curve(labels, predicted))
 
-    """
-    report = ""
-    df['Best'] = answers
-    scores = pd.DataFrame(scores, index=df.index)
-    df = pd.concat([df, scores], axis=1)
-    df_errs = df['Best'] == 'ERROR'
-    df2 = df[~(df_errs)]
-    # Disable chained-assignments warnings for the next 3 lines
-    # I'm pretty sure I'm not creating a copy of df2 here.
-    pd.set_option('mode.chained_assignment', None)
-    df2['Plural'] = df2['Best'].map(lambda x: x + 's')
-    df2['Correct?'] = (df2['Best'] == df2[colname]) | (df2['Plural'] == df2[colname])
-    pd.set_option('mode.chained_assignment', 'warn')
+    # df, df_err, report = score_df(df, answers, probs)
+    # df.to_csv(SCORE_FILE)  # , float_format='5.3f')
+    # df.to_json(ERR_FILE)
+    # print("\nURLs with Errors\n---------------\n", df_err)
+    # print("Errors also saved to", ERR_FILE)
+    # print(report)
 
-    if verbose:
-        # print("\ndf:\n----\n", df)
-        # print(df2.filter([colname, 'Best', 'Correct?']))
-        report += "\ndf2\n----\n" + df2.__repr__()
-    n_df = len(df)
-    n_right, n_ok, acc = _accuracy(df2, colname='Correct?')
-    n_err = n_df - n_ok
-    report += "  *ERRORS*: {}/{} = {:4.2f}\n".format(n_err, n_df,
-                                                     n_err / n_df) + "*ACCURACY*: {}/{} = {:4.2f}\n".format(n_right,
-                                                                                                            n_ok, acc)
-    return df2, df[df_errs].filter(['url', 'pagetype', 'Best']), report
-
-
+#check_estimator(JPLPageClass)
 if __name__ == "__main__":
     import pandas as pd
 
+    # URL_File should have fields "url" and "pagetype"
     URL_FILE = '../thh-classifiers/dirbot/full_urls.json'
     # URL_FILE = '50urls.csv'
-    SCORE_FILE = 'scores.csv'
-    ERR_FILE = 'url_errs.json'
+    # URL_FILE = '../thh-classifiers/clfdata/trainAll.json'
+    #SCORE_FILE = 'scores.csv'
+    #ERR_FILE = 'url_errs.json'
     OFFLINE = True
-    MAX_N = 600
+    MAX_N = 500
     MAX_URL_LEN = 70
 
     df = pd.read_json(URL_FILE)
     if OFFLINE:
-        print("Running in OFFLINE mode.")
-    for key, val in gold_words.items():
-        printlist(key, val)
+        logging.info("Running in OFFLINE mode.")
+    logging.info("\n%s\nwebpageclassifier\n%s" % ('-'*18,'-'*18))
 
     df = df.sample(n=MAX_N, random_state=42)  # Subset for testing
-    N = len(df.index)
-    answers, scores = [], []
-    for i, url in tqdm(enumerate(df['url'])):
-        # print('\n%d/%d) %s' % (i+1, N, url[7:MAX_URL_LEN]) )
-        cat, weights = categorize_url(url, gold_words, offline=OFFLINE)
-        try:
-            print_weights(weights)
-        except KeyError:
-            pass
-        print('\t---> %s <--- ' % cat)
-        answers.append(cat)
-        scores.append(weights)
+    clf = make_jpl_clf(df,
+                       categories=[UNDEF, ERROR],
+                       goldwords=gold_words,
+                       offline=True)
+    #probs = clf.predict_proba(df)
+    predicted = clf.predict(df.url)
+    evaluate(df, clf, predicted)
 
-    df, df_err, report = score_df(df, answers, scores)
-    df.to_csv(SCORE_FILE)  # , float_format='5.3f')
-    df.to_json(ERR_FILE)
-    print("\nURLs with Errors\n---------------\n", df_err)
-    print("Errors also saved to", ERR_FILE)
-    print(report)
