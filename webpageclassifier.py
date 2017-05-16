@@ -5,6 +5,7 @@ import math
 import re
 import numpy as np
 
+from tqdm import tqdm
 from wpc_utils import *
 
 from sklearn.base import BaseEstimator, TransformerMixin
@@ -56,6 +57,10 @@ whereas a 'shopping' page had different kinds of selling words (of course there 
 overlap, the the code takes care of that). Then it checks see if the predicted type is
 independently relevent as a classified of shopping web page (using a threshhold).
 
+ERROR: Uses goldenwords from a labeled set: words that occurred on error pages but not
+ others.  Think '404' and less diagnostic sets. Tried last on the assumption an error
+ page won't resemble other things. 
+
 The flow of how the sites are checked here is very important because of the heirarchy
 on the internet (say a forum can be a shopping forum - the code will correctly classify
 it as a forum)
@@ -92,10 +97,10 @@ __author__ = ['Asitang Mishra jpl memex',
               'Charles Twardy sotera memex']
 
 THRESH = 0.40
-UNDEF = 'UNDEFINED'
-ERROR = 'ERROR'
+UNDEF = 'UNCERTAIN'
+ERROR = 'error'
 categories = 'blog, classified, forum, news, shopping, wiki'.split(', ')
-categories.append(UNDEF)
+categories.extend([UNDEF, ERROR])
 gold_words = get_goldwords(categories, KEYWORD_DIR)
 
 
@@ -172,19 +177,24 @@ def name_in_url(url):
     return url_type
 
 
+def get_contents(tags, html, label):
+    """Extract _tags_ from _html_, normalize, and return as string of words"""
+    contents = extract_all_fromtag(tags, html)
+    contents = (re.sub('[^A-Za-z0-9]+', ' ', x.text).strip() for x in contents)
+    logging.debug(prettylist('%s contents:' % label, contents))
+    return ' '.join(contents).split(' ')
+
 def forum_score(html, forum_classnames):
     """Return cosine similarity between the forum_classnames and
     the 'class' attribute of certain tags.
     """
     tags = ['tr', 'td', 'table', 'div', 'p', 'article']
-    classlist = extract_all_classnames(tags, html)
-    logging.debug(prettylist('forum classlist:', classlist))
+    contents = get_contents(tags, html, 'forum')
     # Keep only matches, and only in canonical form. So 'forum' not 'forums'.
     # TODO: doesn't this artificially inflate cosine_sim? By dropping non-matches?
-    classlist = [j for i in classlist for j in forum_classnames if j in i]
-    logging.debug(prettylist('canonical form :', classlist))
-
-    return cosine_sim(classlist, forum_classnames)
+    contents = [j for i in contents for j in forum_classnames if j in i]
+    logging.debug(prettylist('canonical form :', contents))
+    return cosine_sim(contents, forum_classnames)
 
 
 def news_score(html, news_list):
@@ -192,12 +202,16 @@ def news_score(html, news_list):
     (all content, class and tags within), use similarity
     """
     tags = ['nav', 'header', 'footer']
-    contents = extract_all_fromtag(tags, html)
-    contents = (re.sub('[^A-Za-z0-9]+', ' ', x.text).strip() for x in contents)
-    contents = ' '.join(contents).split(' ')
-    logging.debug(prettylist('news contents:', contents))
+    contents = get_contents(tags, html, 'news')
     return cosine_sim(contents, news_list)
 
+
+def error_score(html, error_list):
+    """Check text against 'error' goldenwords; use similarity
+    """
+    tags = ['tr', 'td', 'table', 'div', 'p', 'article', 'body']
+    contents = get_contents(tags, html, 'error')
+    return cosine_sim(contents, error_list)
 
 def get_cosines(text, gold, vals={}):
     """Calculate all cosine similarity scores.
@@ -213,18 +227,21 @@ def get_cosines(text, gold, vals={}):
     text_list = text.split(' ') + [' '.join(x) for x in ngrams(text, 2)]
     vals['classified'] = cosine_sim(text_list, gold['classified'])
     vals['shopping'] = cosine_sim(text_list, gold['shopping'])
+    vals[ERROR] = cosine_sim(text_list, gold['error'])
     return vals
 
 
 def make_jpl_clf(df,
                  categories: list,
                  goldwords: dict,
-                 offline=False):
+                 offline=False,
+                 pagetypes=None):
     """Create the JPL classifier with appropriate labels.
     :param df: 
     :param categories: 
     :param goldwords: 
     :param offline: 
+    :param pagetypes: list of training labels; default is df.pagetype or df.category
     :return: the classifier, with cleaned labels in classifier.labels
     
     """
@@ -234,7 +251,11 @@ def make_jpl_clf(df,
                          ('jpl', JPLPageClass(categories=categories,
                                               goldwords=goldwords,
                                               offline=offline))])
-    pagetypes = list(df.pagetype)
+    if pagetypes is None:
+        try:
+            pagetypes = list(df.pagetype)
+        except AttributeError:
+            pagetypes = list(df.category)
     pagetypes = Lemmatizer(wnl=False).fit(pagetypes).transform(pagetypes)
     clf_pipe.fit(df.url, pagetypes)
     logging.info("Classifier 'training' completed.")
@@ -383,7 +404,7 @@ class JPLPageClass(BaseEstimator):
     def _score_url(self,
                    url: 'The URL ',
                    bleach: bool):
-        """Score the URL using JPL cascade. Only load HTML if URL inconclusive.
+        """Score the URL using JPL cascade. Only parse HTML if URL inconclusive.
 
         :param url: The url to score 
         :param bleach: bool - Try cleaner url if original fails.
@@ -391,7 +412,7 @@ class JPLPageClass(BaseEstimator):
         """
         # TODO: Move definitions back to predict_proba, and pass in.
         # As-is, it has to do "self." lookups for each URL.
-        logging.info('URL: %s' % url[7:MAX_URL_LEN])
+        logging.debug('URL: %s' % url[:MAX_URL_LEN])
         𝜃 = self.thresh
         scores = np.ones(len(self.classes_)) * .1
         idx = dict([(key,i) for i, key in enumerate(self.classes_)])
@@ -451,14 +472,48 @@ class JPLPageClass(BaseEstimator):
         return [surl(url, bleach=True) for url in X]
 
 
+def evaluate(df, clf, predicted):
+    """Evaluate the classifier based on its predictions."""
+    labels = clf.named_steps['jpl'].labels
+    classes_ = list(clf.classes_)
+
+    print(metrics.classification_report(labels, predicted))
+    print("Confusion Matrix:")
+    for row in zip(classes_, metrics.confusion_matrix(labels, predicted)):
+        print('%20s: %s' % (row[0],
+                            ','.join(['%4d' % x for x in row[1]])))
+    print("\n   µ Info: %4.2f" % metrics.adjusted_mutual_info_score(labels, predicted))
+
+    # Homebrew reporting
+    model = clf.steps[-1][1]
+    print('   Total #: %4d' % len(df.url))
+    print('   #Errors: %4d \t(%4d Bleached)' % (len(model.errors), len(model.bleached)))
+    print('#Predicted: %4d' % len(predicted))
+    print('  Accuracy: %4.2f' % np.mean(predicted == labels))
+    print("\nErrors:")
+    for row in model.errors:
+        print('\t', row)
+    # print(metrics.auc(labels, predicted))
+    # print("ROC Curve:")
+    # print(metrics.roc_curve(labels, predicted))
+
+    # df, df_err, report = score_df(df, answers, probs)
+    # df.to_csv(SCORE_FILE)  # , float_format='5.3f')
+    # df.to_json(ERR_FILE)
+    # print("\nURLs with Errors\n---------------\n", df_err)
+    # print("Errors also saved to", ERR_FILE)
+    # print(report)
+
 #check_estimator(JPLPageClass)
 if __name__ == "__main__":
     import pandas as pd
 
+    # URL_File should have fields "url" and "pagetype"
     URL_FILE = '../thh-classifiers/dirbot/full_urls.json'
     # URL_FILE = '50urls.csv'
-    SCORE_FILE = 'scores.csv'
-    ERR_FILE = 'url_errs.json'
+    # URL_FILE = '../thh-classifiers/clfdata/trainAll.json'
+    #SCORE_FILE = 'scores.csv'
+    #ERR_FILE = 'url_errs.json'
     OFFLINE = True
     MAX_N = 500
     MAX_URL_LEN = 70
@@ -475,40 +530,5 @@ if __name__ == "__main__":
                        offline=True)
     #probs = clf.predict_proba(df)
     predicted = clf.predict(df.url)
-    labels = clf.named_steps['jpl'].labels
+    evaluate(df, clf, predicted)
 
-    # Show each result
-    for url, cat in zip(df.url, predicted):
-        print('%25r => %s' % (url[7:30], cat))
-
-    # Remove rows with errors
-    labels, predicted = zip(*[row for row in zip(labels, predicted) if row[1] != ERROR])
-    labels, predicted = np.array(labels), np.array(predicted)
-    classes_ = list(clf.classes_)
-    classes_.remove(ERROR)
-
-    # Metrics
-    print(metrics.classification_report(labels, predicted))
-    print("Confusion Matrix:")
-    for row in zip(classes_, metrics.confusion_matrix(labels, predicted)):
-        print('%20s: %s' % row)
-    print("\n   µ Info: %4.2f" % metrics.adjusted_mutual_info_score(labels, predicted))
-    # Homebrew reporting
-    model = clf.steps[-1][1]
-    print('  Total #: %4d' % len(df.url))
-    print('  #Errors: %4d \t(%4d Bleached)' % (len(model.errors), len(model.bleached)))
-    print('#Predictd: %4d' % len(predicted))
-    print(' Accuracy: %4.2f' % np.mean(predicted == labels))
-    print("\nErrors:")
-    for row in model.errors:
-        print('\t', row)
-    #print(metrics.auc(labels, predicted))
-    #print("ROC Curve:")
-    #print(metrics.roc_curve(labels, predicted))
-
-    #df, df_err, report = score_df(df, answers, probs)
-    #df.to_csv(SCORE_FILE)  # , float_format='5.3f')
-    #df.to_json(ERR_FILE)
-    #print("\nURLs with Errors\n---------------\n", df_err)
-    #print("Errors also saved to", ERR_FILE)
-    #print(report)

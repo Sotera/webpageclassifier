@@ -116,11 +116,26 @@ def get_goldwords(names, folder):
         gold_words[name] = read_golden(folder + name + '.txt')
     return gold_words
 
+def store_html(url, html, filename=None):
+    """Store html to local file in PAGES_DIR. Filename defaults to cleaned url.
+        :param url: string
+        :param html: string
+        :param filename: string or None - if None, use cleaned url
+        :returns: filename
+    """
+    if filename is None:
+        filename = '{}.html'.format(clean_url(url))
+    with open(PAGES_DIR + filename, 'w') as f:
+        f.write(html)
+    return filename
 
 def get_html(url, filename=None, offline=True):
-    """Get HTML from local file or the web. If web, write local file to filename.
+    """Get HTML from local file or the web. If web, save a copy to filename.
+    Local files are in PAGES_DIR.
     
-    If 
+        :param filename: string - the filename. Default is <clean url>.html.
+        :param offline: bool - True to look locally, False to browse the web
+        :returns: html string
     """
     name, url = clean_url(url), expand_url(url)
     logging.debug("\tFetching HTML for %s..." % url[7:30])
@@ -136,8 +151,7 @@ def get_html(url, filename=None, offline=True):
             logging.info("\tFailed to find %s offline. Trying live URL." % filename)
 
     html = read_url(url)
-    with open(PAGES_DIR + filename, 'w') as f:
-        f.write(html)
+    store_html(url, html, filename)
     return html
 
 
@@ -215,7 +229,7 @@ def read_url(url):
         logging.warning("\tCOOKIES : %s" % [x for x in r.cookies])
         logging.warning("\tHISTORY : %s" % r.history)
         logging.warning("\tHEADERS : %s" % r.headers)
-        logging.warning("\tRESPONSE: %s" % r.text[:200].replace('\n', '\n\t'), '...')
+        logging.warning("\tRESPONSE: %s..." % r.text[:200].replace('\n', '\n\t'))
     except UnboundLocalError:
         logging.error("\tERROR   : r was undefined - no further information available")
         return "%s - Connection Error: no response item" % HTTP_ERROR
