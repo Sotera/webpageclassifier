@@ -4,11 +4,12 @@
 import math
 import re
 import numpy as np
+import arrow
 
-from tqdm import tqdm
 from wpc_utils import *
 
 from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.externals.joblib.parallel import cpu_count, Parallel, delayed
 from sklearn.utils.validation import check_X_y, check_array, check_is_fitted
 from sklearn.utils.multiclass import unique_labels
 from sklearn.preprocessing import LabelEncoder
@@ -99,10 +100,8 @@ __author__ = ['Asitang Mishra jpl memex',
 THRESH = 0.40
 UNDEF = 'UNCERTAIN'
 ERROR = 'error'
-categories = 'blog, classified, forum, news, shopping, wiki'.split(', ')
-categories.extend([UNDEF, ERROR])
-gold_words = get_goldwords(categories, KEYWORD_DIR)
-
+OFFLINE = True
+MAX_URL_LEN = 70  # For pretty-printing
 
 def ngrams(word, n):
     """Creates n-grams for a string, returning a list.
@@ -207,16 +206,16 @@ def news_score(html, news_list):
 
 
 def error_score(html, error_list):
-    """Check text against 'error' goldenwords; use similarity
+    """Check text against ERROR goldenwords; use similarity
     """
     tags = ['tr', 'td', 'table', 'div', 'p', 'article', 'body']
-    contents = get_contents(tags, html, 'error')
+    contents = get_contents(tags, html, ERROR)
     return cosine_sim(contents, error_list)
 
 def get_cosines(text, gold, vals={}):
     """Calculate all cosine similarity scores.
     :param text: - str, the HTML or text to score
-    :param gold: - list, the list of gold words or key words
+    :param gold: - dict, the dict of gold word lists, keyed by category
     :param vals: - dict of scores by name, including: forum, news, classified, shopping
     :returns: _vals_, overwriting those 4 fields, if supplied.
     
@@ -224,40 +223,42 @@ def get_cosines(text, gold, vals={}):
     vals['forum'] = forum_score(text, gold['forum'])
     vals['news'] = news_score(text, gold['news'])
     text = re.sub(u'[^A-Za-z0-9]+', ' ', text)
-    text_list = text.split(' ') + [' '.join(x) for x in ngrams(text, 2)]
-    vals['classified'] = cosine_sim(text_list, gold['classified'])
+
+    text_list = text.split(' ')
+    vals[ERROR] = cosine_sim(text_list, gold[ERROR])
     vals['shopping'] = cosine_sim(text_list, gold['shopping'])
-    vals[ERROR] = cosine_sim(text_list, gold['error'])
+
+    text_list.extend([' '.join(x) for x in ngrams(text, 2)])
+    vals['classified'] = cosine_sim(text_list, gold['classified'])
     return vals
 
 
-def make_jpl_clf(df,
-                 categories: list,
-                 goldwords: dict,
-                 offline=False,
-                 pagetypes=None):
-    """Create the JPL classifier with appropriate labels.
-    :param df: 
-    :param categories: 
-    :param goldwords: 
-    :param offline: 
-    :param pagetypes: list of training labels; default is df.pagetype or df.category
-    :return: the classifier, with cleaned labels in classifier.labels
+def make_jpl_clf(X, y,
+                 goldwords: dict=None,
+                 offline=True):
+    """Wrapper to create the JPL classifier.
+     
+     Note that "fitting" this classifier is just checking for extraneous labels (y).
+     Previously I had tried to put it in a pipeline with a Lemmatizer to clean
+     up the labels. But that doesn't work because pipeline.transform() affects X, 
+     not y.  So it's up to the caller to notice the mismatch and fix. 
+     
+     However, despite having only a single step, I'll leave the Pipeline in place,
+     in case we later find it useful to preprocess the URLs.
+    
+    :param X: Input data, here **urls**.
+    :param y: Labels -- only used to check for unexpected values.
+    :param goldwords: dict of {category: wordlist} of gold words for each category.
+    :param offline: set True to use cached pages in KEYWORD_DIR
+    :param xcol: name of column containing URLs
+    :param ycol: name of column containing labels
+    :return: the classifier
     
     """
     logging.info("Creating JPL classifier")
-    clf_pipe = Pipeline([#('stem', Lemmatizer()),
-                         #('le', LabelEncoder()),
-                         ('jpl', JPLPageClass(categories=categories,
-                                              goldwords=goldwords,
+    clf_pipe = Pipeline([('jpl', JPLPageClass(goldwords=goldwords,
                                               offline=offline))])
-    if pagetypes is None:
-        try:
-            pagetypes = list(df.pagetype)
-        except AttributeError:
-            pagetypes = list(df.category)
-    pagetypes = Lemmatizer(wnl=False).fit(pagetypes).transform(pagetypes)
-    clf_pipe.fit(df.url, pagetypes)
+    clf_pipe.fit(X, y)
     logging.info("Classifier 'training' completed.")
     return clf_pipe
 
@@ -265,15 +266,13 @@ def make_jpl_clf(df,
 class Lemmatizer(BaseEstimator, TransformerMixin):
     """Cleans up labels. Uses WordNet if avail, else simplistic strip final 's'.
     
-    Based this on LabelTransf
-    #TODO: Figure out how to get this into a classifier pipeline. 
-    Right now it throws:
-    `TypeError: fit_transform() takes 2 positional arguments but 3 were given`
+    Based this on LabelTransform: it CANNOT be put into a classifier pipeline,
+    because it transforms y, not X.
     
     >>> labels = ['forum', 'forums', 'news', 'blog', 'blogs', 'news', 'error']
     >>> lem = Lemmatizer().fit(labels)
     >>> lem.classes_
-    ['UNDEFINED', 'blog', 'error', 'forum', 'news']
+    ['blog', 'error', 'forum', 'news']
     
     >>> lem.transform(labels)
     ['forum', 'forum', 'news', 'blog', 'blog', 'news', 'error']
@@ -284,7 +283,7 @@ class Lemmatizer(BaseEstimator, TransformerMixin):
 
     We want 'wikis' -> 'wiki'. So:
     >>> lem2 = Lemmatizer(wnl=False).fit(labels)
-    >>> lem2.transform(['wiki', 'wikis', 'shopping'])
+    >>> lem2.transform(X, ['wiki', 'wikis', 'shopping'])
     ['wiki', 'wiki', 'shopping']
          
     """
@@ -302,21 +301,20 @@ class Lemmatizer(BaseEstimator, TransformerMixin):
         Note: `categories` will still be lemmatized unless in `goodlist`.   
         
         """
-        if not wnl:
-            self.wnl = False
-        else:
+        self.wnl = False
+        if wnl:
             try:
                 from nltk.stem import WordNetLemmatizer
-                wnl = WordNetLemmatizer()
+                self.wnl = WordNetLemmatizer()
             except ImportError:
-                wnl = False
+                pass
 
         self.goodlist = frozenset(goodlist)
         self.categories = categories
 
     def fit(self, y):
         """'Fit' lemmatizer. Creates lemmatized classes_ list."""
-        self.classes_ = sorted(set(self._transform(y + self.categories)))
+        self.classes_ = sorted(set(self._transform(list(y) + self.categories)))
         return self
 
     @classmethod
@@ -358,139 +356,164 @@ class JPLPageClass(BaseEstimator):
     Feed it URLs. If it can decide on those, it does, else it uses 
     `get_html()` to fetch HTML and try other methods. 
     
-    Categorizes urls as blog | wiki | news | forum | classified | shopping | _UNDEF_.
+    Categorizes urls as one of a **predefined set**:
+        blog | wiki | news | forum | classified | shopping | _UNDEF_ | _ERROR_
     Returns best guess and a dictionary of scores, which may be empty.
+    See `classes_` for list of known classes.
     
     """
-
+    
+    classes_ = 'blog,wiki,news,forum,classified,shopping'.split(',')
+    classes_.extend([UNDEF, ERROR])
+    
     def __init__(self,
-                 goldwords: dict,
-                 offline=False,
-                 thresh=0.40,
-                 categories: list=[UNDEF, ERROR]):
+                 goldwords: dict=None,
+                 offline=True,
+                 θ=0.40):
         """Set up the JPL Page Classifier.
         
         :param goldwords: dict {label -> "golden words" related to that category
+            Default: use get_goldwords() to load them from category files
         :param offline: bool - True if HTML can be found in standard file loc'n
-        :param thresh: float - If no category > thresh, return UNDEF.
-        :param categories: these are the labels we expect we might see
-
-        
-        Note: stored categories will be _singular_ --> no trailing 's'
+        :param θ: float - If no score > θ, returns UNDEF.
                 
         """
-        self.goldwords = goldwords
         self.offline = offline
-        self.thresh = thresh
-        self.categories = categories
+        self.θ = θ
+        if not goldwords:
+            self.goldwords = get_goldwords(self.classes_, KEYWORD_DIR)
+        else:
+            self.goldwords = goldwords
         self.bleached = []
         self.errors = []
         self._estimator_type = "classifier"
 
-    def fit(self, X, y):
-        """Not really fitting, but...
+    def fit(self, X, y=[]):
+        """Not really fitting, just checks/updates self.classes_.
         
         :param X: list[str] - a list of URLs
         :param y: list[str] - a list of page types or classes
         
         """
-
-        self.classes_= np.unique(list(y) + self.categories)
-        self.labels = y
-        logging.info('\tclasses_: %s' % self.classes_)
+        extras = [x for x in set(list(y)) if x not in self.classes_]
+        if len(extras) > 0:
+            s = "Found %d undeclared categories during 'fitting':\n\t->%s" % (len(extras), extras)
+            logging.warning(s)
         #X, y = check_X_y(X, y)
         return self
 
-    def _score_url(self,
-                   url: 'The URL ',
-                   bleach: bool):
-        """Score the URL using JPL cascade. Only parse HTML if URL inconclusive.
-
-        :param url: The url to score 
-        :param bleach: bool - Try cleaner url if original fails.
-        :return: score vector (numpy array)
-        """
-        # TODO: Move definitions back to predict_proba, and pass in.
-        # As-is, it has to do "self." lookups for each URL.
-        logging.debug('URL: %s' % url[:MAX_URL_LEN])
-        𝜃 = self.thresh
-        scores = np.ones(len(self.classes_)) * .1
-        idx = dict([(key,i) for i, key in enumerate(self.classes_)])
-        def tally(key, val):
-            scores[idx[key]] = val
-
-        # 1. Check for blog goldwords in URL
-        if url_has(url, self.goldwords['blog']):
-            tally('blog', .9)
-        else:
-            # 2. Check for category name in URL
-            name_type = name_in_url(url)
-            if name_type != UNDEF:
-                tally(name_type, .9)
-        if max(scores) > 𝜃:
-            return scores / sum(scores)
-
-        # TODO: URL ngrams
-
-        # 3. Look at the HTML.
-        html = get_html(url, offline=self.offline)
-        if html.startswith(HTTP_ERROR):
-            if bleach and bleach_url(url) != url:
-                logging.info("Bleaching URL...")
-                self.bleached.append(url)
-                return self._score_url(bleach_url(url), bleach=False) # Avoid inf loop!
-            else:
-                logging.warning('%s: %s ' % (HTTP_ERROR, clean_url(url)))
-                self.errors.append(url)
-                tally(ERROR, .9)
-        else:
-            vals = get_cosines(html, self.goldwords)
-            for key, val in vals.items():
-                tally(key, val)
-        if max(scores) > 𝜃:
-            return scores / sum(scores)
-
-        # Fallback
-        tally(UNDEF, 1 - max(scores))
-        return scores / sum(scores)
-
     def predict(self, X):
-        """Return the most likely class, for each x in X."""
-        P = self.predict_proba(X)
-        return self.classes_[np.argmax(P, axis=1)]
+        """Return the most likely class, for each x in X. Store probs in self.P."""
+        self.P = self.predict_proba(X)
+        return self.P.idxmax(axis=1)
 
-    def predict_proba(self, X):
+    def predict_proba(self, X, do_parallel=True):
         """For each x in X, provide vector of probs for each class.
         
         Assume X is a list of URLs, and that `get_html(url)` will
         retrieve HTML as required.
         
+        :param do_parallel: Faster for N > 100 or so.
+        
+        Parallel logic modified from QingKaiKong. Also viewed pomegranate and scikit-issues.
+            * http://qingkaikong.blogspot.com/2016/12/python-parallel-method-in-class.html
+            * https://github.com/jmschrei/pomegranate/blob/master/pomegranate/parallel.pyx
+            * https://github.com/scikit-learn/scikit-learn/issues/7448
+        
         """
-        #check_is_fitted(self, ['X_', 'y_'])
-        #X = check_array(X)
-        surl = self._score_url
-        return [surl(url, bleach=True) for url in X]
+        # check_is_fitted(self, ['X_', 'y_'])
+        # X = check_array(X)
+        n_jobs = cpu_count() - 1
+        n = len(X)
+        starts = [i * n // n_jobs for i in range(n_jobs)]
+        ends = starts[1:] + [n]
+        batches = [X[start:end] for start, end in zip(starts, ends)]
+        # batches = zip([self] * n_jobs, batches)
+        t0 = arrow.now()
+        if do_parallel:
+            with Parallel(n_jobs=n_jobs) as parallel:
+                results = parallel(delayed(batch_score_urls)(batch, self)
+                                   for batch in batches)
+        else:
+            results = (batch_score_urls(batch, self) for batch in batches)
+        results = (pd.DataFrame((row for row in batch), columns=self.classes_)
+                   for batch in results)
+        y = pd.concat(results) if n_jobs > 1 and n_jobs != len(X) else results
+        dt = arrow.now() - t0
+        logging.info('TIMING: Parallel = %s, t = %s, dt = **%3.3fs**' %
+                     (do_parallel, t0.format('HH:mm:ss'), dt.total_seconds()))
+        return y
+
+def batch_score_urls(batch: 'Sequence', object):
+    """Batch wrapper makes it much easier to parallelize."""
+    return batch.apply(score_url, args=(object,))
+
+def score_url(url: 'The URL ', object):
+    """Score the URL using JPL cascade. Only parse HTML if URL inconclusive.
+    
+    Moved outside the class so joblib can pickle. 
+    Now that we wrap with batch_score_urls, possibly could move this
+    back into the JPL class.
+
+    :param url: The url to score 
+    :param object: The JPL classifier object.
+    :return: score vector (numpy array)
+    """
+    # TODO: Move definitions back to predict_proba, and pass in, to avoid 'self' lookups.
+    logging.debug('URL: %s' % url[:MAX_URL_LEN])
+    𝜃 = object.θ
+    scores = np.ones(len(object.classes_)) * .1
+    idx = dict([(key,i) for i, key in enumerate(object.classes_)])
+    def tally(key, val):
+        scores[idx[key]] = val
+
+    # 1. Check for blog goldwords in URL
+    if url_has(url, object.goldwords['blog']):
+        tally('blog', .9)
+    else:
+        # 2. Check for category name in URL
+        name_type = name_in_url(url)
+        if name_type != UNDEF:
+            tally(name_type, .9)
+    if max(scores) > 𝜃:
+        return scores / sum(scores)
+
+    # TODO: URL ngrams
+
+    # 3. Look at the HTML.
+    html = get_html(url, offline=object.offline)
+    if html.startswith(HTTP_ERROR):
+        #logging.warning('%s: %s ' % (HTTP_ERROR, clean_url(url)))
+        object.errors.append(url)
+    vals = get_cosines(html, object.goldwords)
+    for key, val in vals.items():
+        tally(key, val)
+    if max(scores) > 𝜃:
+        return scores / sum(scores)
+
+    # Fallback
+    tally(UNDEF, 1 - max(scores))
+    return scores / sum(scores)
 
 
-def evaluate(df, clf, predicted):
+def evaluate(X, y, predicted, clf):
     """Evaluate the classifier based on its predictions."""
-    labels = clf.named_steps['jpl'].labels
-    classes_ = list(clf.classes_)
-
-    print(metrics.classification_report(labels, predicted))
+    classes_ = clf.classes_
+    print(metrics.classification_report(y, predicted, labels=classes_))
     print("Confusion Matrix:")
-    for row in zip(classes_, metrics.confusion_matrix(labels, predicted)):
+    for row in zip(classes_,
+                   metrics.confusion_matrix(y, predicted, labels=classes_)):
         print('%20s: %s' % (row[0],
                             ','.join(['%4d' % x for x in row[1]])))
-    print("\n   µ Info: %4.2f" % metrics.adjusted_mutual_info_score(labels, predicted))
+    print("\n   µ Info: %4.2f" % metrics.adjusted_mutual_info_score(y, predicted))
 
     # Homebrew reporting
     model = clf.steps[-1][1]
-    print('   Total #: %4d' % len(df.url))
-    print('   #Errors: %4d \t(%4d Bleached)' % (len(model.errors), len(model.bleached)))
+    print('   Total #: %4d' % len(X))
     print('#Predicted: %4d' % len(predicted))
-    print('  Accuracy: %4.2f' % np.mean(predicted == labels))
-    print("\nErrors:")
+    print('  Accuracy: %4.2f' % np.mean(predicted == y))
+    print("\n%d Errors -- HTML started with %s." % (len(model.errors), HTTP_ERROR))
+    print("Either get new HTML or label these as category 'error'.")
     for row in model.errors:
         print('\t', row)
     # print(metrics.auc(labels, predicted))
@@ -508,27 +531,20 @@ def evaluate(df, clf, predicted):
 if __name__ == "__main__":
     import pandas as pd
 
-    # URL_File should have fields "url" and "pagetype"
-    URL_FILE = '../thh-classifiers/dirbot/full_urls.json'
-    # URL_FILE = '50urls.csv'
-    # URL_FILE = '../thh-classifiers/clfdata/trainAll.json'
-    #SCORE_FILE = 'scores.csv'
     #ERR_FILE = 'url_errs.json'
-    OFFLINE = True
+    URL_FILE = '../thh-classifiers/dirbot/full_urls.json'
     MAX_N = 500
-    MAX_URL_LEN = 70
-
+    logging.info("Running [%s] as __main__.\n"
+                 "-----------------------------------------------------\n"
+                 "Training file: [%s].\n"
+                 "OFFLINE = %s, MAX_N = %d\n"
+                 % (__file__, URL_FILE, OFFLINE, MAX_N))
     df = pd.read_json(URL_FILE)
-    if OFFLINE:
-        logging.info("Running in OFFLINE mode.")
-    logging.info("\n%s\nwebpageclassifier\n%s" % ('-'*18,'-'*18))
-
     df = df.sample(n=MAX_N, random_state=42)  # Subset for testing
-    clf = make_jpl_clf(df,
-                       categories=[UNDEF, ERROR],
-                       goldwords=gold_words,
-                       offline=True)
+    X = df.url
+    y = Lemmatizer(wnl=True).fit_transform(df.pagetype)
+    clf = make_jpl_clf(X, y, offline=OFFLINE)
     #probs = clf.predict_proba(df)
-    predicted = clf.predict(df.url)
-    evaluate(df, clf, predicted)
+    predicted = clf.predict(X)
+    evaluate(X, y, predicted, clf)
 

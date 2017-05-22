@@ -116,6 +116,7 @@ def get_goldwords(names, folder):
         gold_words[name] = read_golden(folder + name + '.txt')
     return gold_words
 
+
 def store_html(url, html, filename=None):
     """Store html to local file in PAGES_DIR. Filename defaults to cleaned url.
         :param url: string
@@ -242,7 +243,8 @@ def read_golden(filepath):
     """
     goldenlist = []
     try:
-        with open(filepath, 'r', encoding='cp1252', errors='ignore') as f:
+        encoding = 'utf8' # 'cp1252'
+        with open(filepath, 'r', encoding=encoding, errors='ignore') as f:
             goldenlist = [x.lower().strip() for x in f.readlines()]
     except FileNotFoundError:
         logging.debug('Not found: %s. Making blank goldwords list.' % filepath)
@@ -262,6 +264,7 @@ def score_df(df, answers, scores, colname='pagetype', verbose=False):
                                     string with ERROR & ACC counts)
 
     """
+    import pandas as pd
     report = []
     df['Best'] = answers
     scores = pd.DataFrame(scores, index=df.index)
