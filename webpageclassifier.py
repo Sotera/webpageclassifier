@@ -4,10 +4,12 @@
 import math
 import re
 import numpy as np
+import arrow
 
 from wpc_utils import *
 
 from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.externals.joblib.parallel import cpu_count, Parallel, delayed
 from sklearn.utils.validation import check_X_y, check_array, check_is_fitted
 from sklearn.utils.multiclass import unique_labels
 from sklearn.preprocessing import LabelEncoder
@@ -98,6 +100,8 @@ __author__ = ['Asitang Mishra jpl memex',
 THRESH = 0.40
 UNDEF = 'UNCERTAIN'
 ERROR = 'error'
+OFFLINE = True
+MAX_URL_LEN = 70  # For pretty-printing
 
 def ngrams(word, n):
     """Creates n-grams for a string, returning a list.
@@ -309,7 +313,7 @@ class Lemmatizer(BaseEstimator, TransformerMixin):
         self.categories = categories
 
     def fit(self, y):
-        """'Fit' lemmatizer. Creates lemmatized classes_ list. Ignores X."""
+        """'Fit' lemmatizer. Creates lemmatized classes_ list."""
         self.classes_ = sorted(set(self._transform(list(y) + self.categories)))
         return self
 
@@ -335,7 +339,7 @@ class Lemmatizer(BaseEstimator, TransformerMixin):
         return ans
 
     def transform(self, y):
-        """Lemmatize the labels and check if new labels have appeared. Ignores X."""
+        """Lemmatize the labels and check if new labels have appeared."""
         labels = self._transform(y)
         classes = np.unique(labels)
         if len(np.intersect1d(classes, self.classes_)) < len(classes):
@@ -355,10 +359,13 @@ class JPLPageClass(BaseEstimator):
     Categorizes urls as one of a **predefined set**:
         blog | wiki | news | forum | classified | shopping | _UNDEF_ | _ERROR_
     Returns best guess and a dictionary of scores, which may be empty.
-    See `self.classes_` for list of known classes.
+    See `classes_` for list of known classes.
     
     """
-
+    
+    classes_ = 'blog,wiki,news,forum,classified,shopping'.split(',')
+    classes_.extend([UNDEF, ERROR])
+    
     def __init__(self,
                  goldwords: dict=None,
                  offline=True,
@@ -373,8 +380,6 @@ class JPLPageClass(BaseEstimator):
         """
         self.offline = offline
         self.θ = θ
-        self.classes_ = 'blog,wiki,news,forum,classified,shopping'.split(',')
-        self.classes_.extend([UNDEF, ERROR])
         if not goldwords:
             self.goldwords = get_goldwords(self.classes_, KEYWORD_DIR)
         else:
@@ -392,80 +397,103 @@ class JPLPageClass(BaseEstimator):
         """
         extras = [x for x in set(list(y)) if x not in self.classes_]
         if len(extras) > 0:
-            logging.warning("Found %d undeclared categories during 'fitting':" % len(extras))
-            logging.warning("  -> %s" % extras)
+            s = "Found %d undeclared categories during 'fitting':\n\t->%s" % (len(extras), extras)
+            logging.warning(s)
         #X, y = check_X_y(X, y)
         return self
-
-    def _score_url(self,
-                   url: 'The URL ',
-                   bleach: bool):
-        """Score the URL using JPL cascade. Only parse HTML if URL inconclusive.
-
-        :param url: The url to score 
-        :param bleach: bool - Try cleaner url if original fails.
-        :return: score vector (numpy array)
-        """
-        # TODO: Move definitions back to predict_proba, and pass in.
-        # As-is, it has to do "self." lookups for each URL.
-        logging.debug('URL: %s' % url[:MAX_URL_LEN])
-        𝜃 = self.θ
-        scores = np.ones(len(self.classes_)) * .1
-        idx = dict([(key,i) for i, key in enumerate(self.classes_)])
-        def tally(key, val):
-            scores[idx[key]] = val
-
-        # 1. Check for blog goldwords in URL
-        if url_has(url, self.goldwords['blog']):
-            tally('blog', .9)
-        else:
-            # 2. Check for category name in URL
-            name_type = name_in_url(url)
-            if name_type != UNDEF:
-                tally(name_type, .9)
-        if max(scores) > 𝜃:
-            return scores / sum(scores)
-
-        # TODO: URL ngrams
-
-        # 3. Look at the HTML.
-        html = get_html(url, offline=self.offline)
-        if html.startswith(HTTP_ERROR):
-            if bleach and bleach_url(url) != url:
-                logging.info("HTTP error. Bleaching URL & trying again...")
-                self.bleached.append(url)
-                return self._score_url(bleach_url(url), bleach=False) # Avoid inf loop!
-            else:
-                logging.warning('%s: %s ' % (HTTP_ERROR, clean_url(url)))
-                self.errors.append(url)
-                tally(ERROR, .9)
-        else:
-            vals = get_cosines(html, self.goldwords)
-            for key, val in vals.items():
-                tally(key, val)
-        if max(scores) > 𝜃:
-            return scores / sum(scores)
-
-        # Fallback
-        tally(UNDEF, 1 - max(scores))
-        return scores / sum(scores)
 
     def predict(self, X):
         """Return the most likely class, for each x in X. Store probs in self.P."""
         self.P = self.predict_proba(X)
-        return [self.classes_[i] for i in np.argmax(self.P, axis=1)]
+        return self.P.idxmax(axis=1)
 
-    def predict_proba(self, X):
+    def predict_proba(self, X, do_parallel=True):
         """For each x in X, provide vector of probs for each class.
         
         Assume X is a list of URLs, and that `get_html(url)` will
         retrieve HTML as required.
         
+        :param do_parallel: Faster for N > 100 or so.
+        
+        Parallel logic modified from QingKaiKong. Also viewed pomegranate and scikit-issues.
+            * http://qingkaikong.blogspot.com/2016/12/python-parallel-method-in-class.html
+            * https://github.com/jmschrei/pomegranate/blob/master/pomegranate/parallel.pyx
+            * https://github.com/scikit-learn/scikit-learn/issues/7448
+        
         """
-        #check_is_fitted(self, ['X_', 'y_'])
-        #X = check_array(X)
-        surl = self._score_url
-        return [surl(url, bleach=True) for url in X]
+        # check_is_fitted(self, ['X_', 'y_'])
+        # X = check_array(X)
+        n_jobs = cpu_count() - 1
+        n = len(X)
+        starts = [i * n // n_jobs for i in range(n_jobs)]
+        ends = starts[1:] + [n]
+        batches = [X[start:end] for start, end in zip(starts, ends)]
+        # batches = zip([self] * n_jobs, batches)
+        t0 = arrow.now()
+        if do_parallel:
+            with Parallel(n_jobs=n_jobs) as parallel:
+                results = parallel(delayed(batch_score_urls)(batch, self)
+                                   for batch in batches)
+        else:
+            results = (batch_score_urls(batch, self) for batch in batches)
+        results = (pd.DataFrame((row for row in batch), columns=self.classes_)
+                   for batch in results)
+        y = pd.concat(results) if n_jobs > 1 and n_jobs != len(X) else results
+        dt = arrow.now() - t0
+        logging.info('TIMING: Parallel = %s, t = %s, dt = **%3.3fs**' %
+                     (do_parallel, t0.format('HH:mm:ss'), dt.total_seconds()))
+        return y
+
+def batch_score_urls(batch: 'Sequence', object):
+    """Batch wrapper makes it much easier to parallelize."""
+    return batch.apply(score_url, args=(object,))
+
+def score_url(url: 'The URL ', object):
+    """Score the URL using JPL cascade. Only parse HTML if URL inconclusive.
+    
+    Moved outside the class so joblib can pickle. 
+    Now that we wrap with batch_score_urls, possibly could move this
+    back into the JPL class.
+
+    :param url: The url to score 
+    :param object: The JPL classifier object.
+    :return: score vector (numpy array)
+    """
+    # TODO: Move definitions back to predict_proba, and pass in, to avoid 'self' lookups.
+    logging.debug('URL: %s' % url[:MAX_URL_LEN])
+    𝜃 = object.θ
+    scores = np.ones(len(object.classes_)) * .1
+    idx = dict([(key,i) for i, key in enumerate(object.classes_)])
+    def tally(key, val):
+        scores[idx[key]] = val
+
+    # 1. Check for blog goldwords in URL
+    if url_has(url, object.goldwords['blog']):
+        tally('blog', .9)
+    else:
+        # 2. Check for category name in URL
+        name_type = name_in_url(url)
+        if name_type != UNDEF:
+            tally(name_type, .9)
+    if max(scores) > 𝜃:
+        return scores / sum(scores)
+
+    # TODO: URL ngrams
+
+    # 3. Look at the HTML.
+    html = get_html(url, offline=object.offline)
+    if html.startswith(HTTP_ERROR):
+        #logging.warning('%s: %s ' % (HTTP_ERROR, clean_url(url)))
+        object.errors.append(url)
+    vals = get_cosines(html, object.goldwords)
+    for key, val in vals.items():
+        tally(key, val)
+    if max(scores) > 𝜃:
+        return scores / sum(scores)
+
+    # Fallback
+    tally(UNDEF, 1 - max(scores))
+    return scores / sum(scores)
 
 
 def evaluate(X, y, predicted, clf):
@@ -482,10 +510,10 @@ def evaluate(X, y, predicted, clf):
     # Homebrew reporting
     model = clf.steps[-1][1]
     print('   Total #: %4d' % len(X))
-    print('   #Errors: %4d \t(%4d Bleached)' % (len(model.errors), len(model.bleached)))
     print('#Predicted: %4d' % len(predicted))
     print('  Accuracy: %4.2f' % np.mean(predicted == y))
-    print("\nErrors:")
+    print("\n%d Errors -- HTML started with %s." % (len(model.errors), HTTP_ERROR))
+    print("Either get new HTML or label these as category 'error'.")
     for row in model.errors:
         print('\t', row)
     # print(metrics.auc(labels, predicted))
@@ -505,14 +533,11 @@ if __name__ == "__main__":
 
     #ERR_FILE = 'url_errs.json'
     URL_FILE = '../thh-classifiers/dirbot/full_urls.json'
-    OFFLINE = True
     MAX_N = 500
-    MAX_URL_LEN = 70
     logging.info("Running [%s] as __main__.\n"
                  "-----------------------------------------------------\n"
                  "Training file: [%s].\n"
                  "OFFLINE = %s, MAX_N = %d\n"
-                 "   Training file needs 'url' and 'pagetype' fields.'\n"
                  % (__file__, URL_FILE, OFFLINE, MAX_N))
     df = pd.read_json(URL_FILE)
     df = df.sample(n=MAX_N, random_state=42)  # Subset for testing
