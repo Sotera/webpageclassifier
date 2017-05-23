@@ -369,17 +369,20 @@ class JPLPageClass(BaseEstimator):
     def __init__(self,
                  goldwords: dict=None,
                  offline=True,
-                 θ=0.40):
+                 θ=0.40,
+                 n_jobs=cpu_count() - 1):
         """Set up the JPL Page Classifier.
         
         :param goldwords: dict {label -> "golden words" related to that category
             Default: use get_goldwords() to load them from category files
         :param offline: bool - True if HTML can be found in standard file loc'n
         :param θ: float - If no score > θ, returns UNDEF.
+        :param n_jobs: int - Set ≤1 to disable parallel.
                 
         """
         self.offline = offline
         self.θ = θ
+        self.n_jobs = n_jobs
         if not goldwords:
             self.goldwords = get_goldwords(self.classes_, KEYWORD_DIR)
         else:
@@ -405,15 +408,14 @@ class JPLPageClass(BaseEstimator):
     def predict(self, X):
         """Return the most likely class, for each x in X. Store probs in self.P."""
         self.P = self.predict_proba(X)
-        return self.P.idxmax(axis=1)
+        label = np.vectorize(lambda x: self.classes_[x])
+        return label(self.P.argmax(axis=1))
 
-    def predict_proba(self, X, do_parallel=True):
+    def predict_proba(self, X):
         """For each x in X, provide vector of probs for each class.
         
         Assume X is a list of URLs, and that `get_html(url)` will
         retrieve HTML as required.
-        
-        :param do_parallel: Faster for N > 100 or so.
         
         Parallel logic modified from QingKaiKong. Also viewed pomegranate and scikit-issues.
             * http://qingkaikong.blogspot.com/2016/12/python-parallel-method-in-class.html
@@ -423,26 +425,22 @@ class JPLPageClass(BaseEstimator):
         """
         # check_is_fitted(self, ['X_', 'y_'])
         # X = check_array(X)
-        n_jobs = cpu_count() - 1
-        n = len(X)
+        n, n_jobs = len(X), self.n_jobs
         starts = [i * n // n_jobs for i in range(n_jobs)]
         ends = starts[1:] + [n]
         batches = [X[start:end] for start, end in zip(starts, ends)]
-        # batches = zip([self] * n_jobs, batches)
         t0 = arrow.now()
-        if do_parallel:
+        if self.n_jobs > 1:
             with Parallel(n_jobs=n_jobs) as parallel:
                 results = parallel(delayed(batch_score_urls)(batch, self)
                                    for batch in batches)
         else:
             results = (batch_score_urls(batch, self) for batch in batches)
-        results = (pd.DataFrame((row for row in batch), columns=self.classes_)
-                   for batch in results)
-        y = pd.concat(results) if n_jobs > 1 and n_jobs != len(X) else results
+        results = np.concatenate([np.array([row for row in batch]) for batch in results])
         dt = arrow.now() - t0
-        logging.info('TIMING: Parallel = %s, t = %s, dt = **%3.3fs**' %
-                     (do_parallel, t0.format('HH:mm:ss'), dt.total_seconds()))
-        return y
+        logging.info('TIMING: n_jobs = %d, t = %s, dt = **%3.3fs**' %
+                     (n_jobs, t0.format('HH:mm:ss'), dt.total_seconds()))
+        return results
 
 def batch_score_urls(batch: 'Sequence', object):
     """Batch wrapper makes it much easier to parallelize."""
