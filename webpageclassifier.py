@@ -20,6 +20,7 @@ from sklearn.feature_extraction.text import CountVectorizer, TfidfTransformer
 from sklearn.linear_model import SGDClassifier
 from sklearn.pipeline import Pipeline
 from sklearn import metrics
+from pandas import DataFrame, Series
 
 logging.basicConfig(level=logging.INFO)
 
@@ -411,11 +412,12 @@ class JPLPageClass(BaseEstimator):
         label = np.vectorize(lambda x: self.classes_[x])
         return label(self.P.argmax(axis=1))
 
-    def predict_proba(self, X):
+    def predict_proba(self, X, π=40):
         """For each x in X, provide vector of probs for each class.
+            :param X: data, a sequence of URLs 
+            :param π: int, threshold for parallelizing. Below this don't bother.
         
-        Assume X is a list of URLs, and that `get_html(url)` will
-        retrieve HTML as required.
+        URLs: JPL7 model assumes`get_html(url)` will retrieve HTML as required.
         
         Parallel logic modified from QingKaiKong. Also viewed pomegranate and scikit-issues.
             * http://qingkaikong.blogspot.com/2016/12/python-parallel-method-in-class.html
@@ -425,28 +427,45 @@ class JPLPageClass(BaseEstimator):
         """
         # check_is_fitted(self, ['X_', 'y_'])
         # X = check_array(X)
+        if type(X) is str:
+            raise(AttributeError, "predict_proba: X must be array-like, not string!")
+
         n, n_jobs = len(X), self.n_jobs
-        starts = [i * n // n_jobs for i in range(n_jobs)]
-        ends = starts[1:] + [n]
-        batches = [X[start:end] for start, end in zip(starts, ends)]
+        if n < π:
+            n_jobs = 1 # Not worth the overhead to parallelize
+            batches = X
+        else:
+            starts = [i * n // n_jobs for i in range(n_jobs)]
+            ends = starts[1:] + [n]
+            batches = [X[start:end] for start, end in zip(starts, ends)]
+
         t0 = arrow.now()
-        if self.n_jobs > 1:
+        if n_jobs > 1:
+            score = delayed(batch_score_urls)
             with Parallel(n_jobs=n_jobs) as parallel:
-                results = parallel(delayed(batch_score_urls)(batch, self)
-                                   for batch in batches)
+                results = parallel(score(batch, self) for batch in batches)
         else:
             results = (batch_score_urls(batch, self) for batch in batches)
         results = np.concatenate([np.array([row for row in batch]) for batch in results])
         dt = arrow.now() - t0
+
         logging.info('TIMING: n_jobs = %d, t = %s, dt = **%3.3fs**' %
                      (n_jobs, t0.format('HH:mm:ss'), dt.total_seconds()))
         return results
 
-def batch_score_urls(batch: 'Sequence', object):
-    """Batch wrapper makes it much easier to parallelize."""
-    return batch.apply(score_url, args=(object,))
 
-def score_url(url: 'The URL ', object):
+def batch_score_urls(batch: 'Series or Sequence we can promote to Series',
+                     object: 'an instance of JPLPageClass'):
+    """Batch wrapper makes it much easier to parallelize.
+    Expects DataFrame or Series. Else tries to coax to DataFrame and continue. """
+    try:
+        return batch.apply(score_url, args=(object,))
+    except AttributeError:
+        logging.info("Trying to convert to Series: %s" % batch)
+        return Series(batch).apply(score_url, args=(object,))
+
+
+def score_url(url: 'The URL ', object: 'an instance of JPLPageClass'):
     """Score the URL using JPL cascade. Only parse HTML if URL inconclusive.
     
     Moved outside the class so joblib can pickle. 
@@ -479,6 +498,7 @@ def score_url(url: 'The URL ', object):
     # TODO: URL ngrams
 
     # 3. Look at the HTML.
+    logging.info('score_url: URL = %s' % url)
     html = get_html(url, offline=object.offline)
     if html.startswith(HTTP_ERROR):
         #logging.warning('%s: %s ' % (HTTP_ERROR, clean_url(url)))

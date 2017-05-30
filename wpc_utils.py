@@ -63,6 +63,7 @@ def clean_url(url, length=25):
     """Clean URL to use as filename.
     Remove http[s]://; Replace / with |; Clip at _length_ chars.
     """
+    logging.info(url)
     if url.startswith('http'):
         start = url.index('//') + 2
         url = url[start:]
